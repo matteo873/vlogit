@@ -1,0 +1,17 @@
+{
+  "name": "Vlogit",
+  "short_name": "Vlogit",
+  "description": "Elke dag vlogt één vriend. De rest scoort. Op het einde van de maand is er een winnaar.",
+  "lang": "nl",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a1c14",
+  "theme_color": "#0a1c14",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
