@@ -76,15 +76,32 @@ function playStep(tr, step, t, out, spb) {
   if (tr.hat.includes(s)) burst(out, t, "highpass", 7000, .5, .001, tr.hatVol, .04);
 }
 
+// Echte nummers: zet chill.mp3, lofi.mp3, zomer.mp3 en hype.mp3 in een map "music".
+// Staat een bestand er niet, dan speelt het ingebouwde deuntje.
+export const musicReady = Promise.all(Object.keys(TRACKS).map(async id => {
+  try {
+    const r = await fetch(`music/${id}.mp3`, { method: "HEAD" });
+    if (r.ok && (r.headers.get("content-type") || "").includes("audio")) TRACKS[id].file = `music/${id}.mp3`;
+  } catch (e) {}
+}));
+
 export function startMusic(id, vol) {
   stopMusic(); if (!id || !TRACKS[id]) return;
-  const c = ac(), tr = TRACKS[id], g = c.createGain(); g.gain.value = vol; g.connect(c.destination);
+  const tr = TRACKS[id];
+  if (tr.file) {
+    const a = new Audio(tr.file); a.loop = true; a.volume = Math.min(1, vol);
+    a.play().catch(() => {});
+    music = { audio: a, g: { gain: { set value(v) { a.volume = Math.min(1, v); } } } };
+    return;
+  }
+  const c = ac(), g = c.createGain(); g.gain.value = vol; g.connect(c.destination);
   const spb = 60 / tr.bpm / 4; let step = 0, next = c.currentTime + .06;
   const iv = setInterval(() => { while (next < c.currentTime + .15) { playStep(tr, step, next, g, spb); next += spb; step = (step + 1) % 64; } }, 30);
   music = { iv, g };
 }
 export function stopMusic() {
   if (!music) return;
+  if (music.audio) { music.audio.pause(); music.audio.src = ""; music = null; return; }
   clearInterval(music.iv);
   const g = music.g; g.gain.setTargetAtTime(.0001, ac().currentTime, .05);
   setTimeout(() => g.disconnect(), 400); music = null;

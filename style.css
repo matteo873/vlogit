@@ -276,3 +276,32 @@ nav .dot{top:4px;right:calc(50% - 16px)}
 .shutter i{display:block;width:62px;height:62px;border-radius:50%;background:#e04848;transition:all .2s}
 .shutter.on i{width:30px;height:30px;border-radius:8px}
 .rec .hint{position:absolute;left:0;right:0;bottom:calc(122px + env(safe-area-inset-bottom,0px));text-align:center;color:#fff;font-size:13px;text-shadow:0 1px 4px #000}
+
+/* ===== Update 2 ===== */
+.av{overflow:hidden;position:relative}
+.av img{width:100%;height:100%;object-fit:cover;display:block}
+.crown{font-size:13px;margin-left:4px}
+.notice{display:flex;align-items:center;gap:12px;border-radius:22px;padding:14px;margin-top:14px}
+.notice .t{flex:1;min-width:0}
+.notice .t b{display:block}
+.winner-card{border-radius:26px;padding:18px;display:flex;gap:14px;align-items:center;margin-top:14px;background:linear-gradient(160deg,rgba(207,230,194,.22),rgba(143,201,160,.08));border:1px solid var(--line)}
+.winner-card .em{font-size:34px;line-height:1}
+.emojis{display:flex;gap:6px;flex-wrap:wrap}
+.emojis button{border:1px solid var(--line);background:var(--surface);border-radius:99px;padding:5px 10px;font-size:15px;display:inline-flex;gap:5px;align-items:center}
+.emojis button span{font-size:12px;font-weight:700;color:var(--muted);font-family:var(--mono)}
+.emojis button[aria-pressed=true]{border-color:var(--hot);background:var(--hot-soft)}
+.emojis button[aria-pressed=true] span{color:var(--ink)}
+.hof{list-style:none;margin:0;padding:0;display:grid}
+.hof li{display:flex;align-items:center;gap:12px;padding:10px 0}
+.hof li+li{border-top:1px solid var(--line)}
+.hof .t{flex:1;min-width:0}
+.hof .t b{display:block;text-transform:capitalize}
+.danger{color:var(--warn)}
+.check-row{display:flex;gap:10px;align-items:flex-start;font-size:14px;color:var(--muted)}
+.check-row input{margin-top:3px;accent-color:var(--hot);width:18px;height:18px;flex:none}
+.check-row a{color:var(--hot)}
+.progress{height:8px;border-radius:9px;background:var(--raise);overflow:hidden}
+.progress i{display:block;height:100%;width:0;background:var(--hot);transition:width .2s}
+.avatar-edit{position:relative;display:inline-grid}
+.avatar-edit label{position:absolute;right:-2px;bottom:-2px;width:30px;height:30px;border-radius:50%;background:var(--hot);color:var(--on-hot);display:grid;place-items:center;cursor:pointer;border:2px solid var(--solid)}
+.pill.warn{background:rgba(242,201,122,.16);color:var(--warn)}

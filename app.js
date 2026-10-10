@@ -1,6 +1,6 @@
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm";
-import { SUPABASE_URL, SUPABASE_KEY } from "./config.js";
-import { FILTERS, SFX, TRACKS, ac, startMusic, stopMusic, previewSfx, playEdit, stopEdit, playingOn, liveSet } from "./audio.js";
+import { SUPABASE_URL, SUPABASE_KEY, VAPID_PUBLIC_KEY, JOBS_FUNCTION } from "./config.js";
+import { FILTERS, SFX, TRACKS, ac, startMusic, stopMusic, previewSfx, playEdit, stopEdit, playingOn, liveSet, musicReady } from "./audio.js";
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -19,6 +19,11 @@ let loaded = {};                          // welke schermen al data hebben
 let draft = null, tool = "trim", sfxAt = 0, publishing = false;
 let homeFilter = "all", picked = new Set();
 let search = { q: "", results: [], t: 0 };
+let jokers = [];                          // {group_id,user_id,day} van deze maand
+const winners = {};                       // per groep: [{month,user_id,avg_score}]
+let pushOn = false, confirmDelete = false, compressing = null;
+const EMOJIS = ["😂", "🔥", "😮", "👏"];
+const PSEL = "id,name,handle,avatar_url";
 
 const TEXTSTYLES = { serif: "Sierlijk", bold: "Dik", type: "Typmachine" };
 const TEXTPOS = { top: "Boven", mid: "Midden", bot: "Onder" };
@@ -60,7 +65,16 @@ const hash = s => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0))
 const color = id => PALETTE[hash(id) % PALETTE.length];
 const nameOf = id => P[id]?.name || "Iemand";
 const shown = id => (me && id === me.id) ? "Jij" : nameOf(id);
-const av = (id, size = "") => `<span class="av ${size}" style="background:${color(id)}">${esc(nameOf(id)[0]?.toUpperCase() || "?")}</span>`;
+const av = (id, size = "") => P[id]?.avatar_url
+  ? `<span class="av ${size}" style="background:${color(id)}"><img src="${esc(P[id].avatar_url)}" alt="" loading="lazy"></span>`
+  : `<span class="av ${size}" style="background:${color(id)}">${esc(nameOf(id)[0]?.toUpperCase() || "?")}</span>`;
+const monthStart = () => todayStr().slice(0, 8) + "01";
+const lastMonthStart = () => addDays(monthStart(), -1).slice(0, 8) + "01";
+// de regerende winnaar van een groep: winnaar van vorige maand
+const reigning = gid => { const w = (winners[gid] || [])[0]; return w && w.month === lastMonthStart() ? w : null; };
+const crown = (id, gid) => { const w = gid ? reigning(gid) : null; return w && w.user_id === id ? `<span class="crown" title="Winnaar van vorige maand">👑</span>` : ""; };
+const jokerToday = g => jokers.find(j => j.group_id === g.id && j.day === todayStr());
+const jokerUsed = (gid, uid) => jokers.some(j => j.group_id === gid && j.user_id === uid && j.day >= monthStart());
 const fmt = n => n == null ? "–" : Number(n).toFixed(1).replace(".", ",");
 const mmss = s => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 const loader = (txt = "Laden…") => `<div class="loading"><div class="spin"></div>${txt}</div>`;
@@ -97,7 +111,7 @@ const val = id => $(id).value.trim();
 
 /* ================= data ================= */
 async function loadProfile() {
-  const { data, error } = await sb.from("profiles").select("id,name,handle").eq("id", session.user.id).single();
+  const { data, error } = await sb.from("profiles").select(PSEL).eq("id", session.user.id).single();
   if (error) throw error;
   me = data; P[me.id] = me;
 }
@@ -105,19 +119,23 @@ async function loadGroups() {
   const { data: mine, error } = await sb.from("group_members").select("group_id").eq("user_id", me.id);
   if (error) throw error;
   const ids = mine.map(r => r.group_id);
-  if (!ids.length) { groups = []; return; }
-  const [r1, r2] = await Promise.all([
+  if (!ids.length) { groups = []; jokers = []; return; }
+  const [r1, r2, r3, ...wins] = await Promise.all([
     sb.from("groups").select("id,name,code,start_date,created_at").in("id", ids).order("created_at"),
-    sb.from("group_members").select("group_id,user_id,position,joined_at,profiles(id,name,handle)").in("group_id", ids)
+    sb.from("group_members").select(`group_id,user_id,position,joined_at,profiles(${PSEL})`).in("group_id", ids),
+    sb.from("jokers").select("group_id,user_id,day").in("group_id", ids).gte("day", monthStart()),
+    ...ids.map(id => sb.rpc("month_winners", { p_group: id }))
   ]);
   if (r1.error) throw r1.error; if (r2.error) throw r2.error;
+  jokers = r3.error ? [] : r3.data;
+  ids.forEach((id, i) => { winners[id] = wins[i].error ? [] : wins[i].data; });
   r2.data.forEach(m => { if (m.profiles) P[m.user_id] = m.profiles; });
   groups = r1.data.map((g, i) => ({ ...g, grad: GRADS[hash(g.id) % GRADS.length],
     members: r2.data.filter(m => m.group_id === g.id).sort((a, b) => a.position - b.position || a.joined_at.localeCompare(b.joined_at)).map(m => m.user_id) }));
 }
 async function loadFriends() {
   const { data, error } = await sb.from("friendships")
-    .select("requester,addressee,status,r:profiles!friendships_requester_fkey(id,name,handle),a:profiles!friendships_addressee_fkey(id,name,handle)");
+    .select(`requester,addressee,status,r:profiles!friendships_requester_fkey(${PSEL}),a:profiles!friendships_addressee_fkey(${PSEL})`);
   if (error) throw error;
   fr = { friends: [], incoming: [], sent: [] };
   data.forEach(f => {
@@ -128,14 +146,14 @@ async function loadFriends() {
     else fr.sent.push(other);
   });
 }
-const VSEL = "id,group_id,author,vlog_date,title,video_path,edit,created_at,ratings(user_id,score),likes(user_id),comments(id,user_id,body,created_at),views(user_id)";
+const VSEL = "id,group_id,author,vlog_date,title,video_path,edit,created_at,ratings(user_id,score),likes(user_id),comments(id,user_id,body,created_at),views(user_id),reactions(user_id,emoji)";
 async function loadVlogs(ids, limit) {
   if (!ids.length) return [];
   const { data, error } = await sb.from("vlogs").select(VSEL).in("group_id", ids)
     .order("vlog_date", { ascending: false }).limit(limit);
   if (error) throw error;
   data.forEach(v => { v.comments.sort((a, b) => a.created_at.localeCompare(b.created_at)); VL.set(v.id, v); });
-  await signUrls(data.map(v => v.video_path));
+  await signUrls(data.map(v => v.video_path).filter(Boolean));
   return data.map(v => v.id);
 }
 async function signUrls(paths) {
@@ -224,6 +242,7 @@ function viewAuth() {
       <div class="field"><label class="label" for="rHandle">Gebruikersnaam</label><div class="at"><input id="rHandle" type="text" autocomplete="username" maxlength="20" autocapitalize="none"></div></div>
       <div class="field"><label class="label" for="rEmail">E-mail</label><input id="rEmail" type="email" autocomplete="email" placeholder="jij@voorbeeld.be"></div>
       <div class="field"><label class="label" for="rPw">Wachtwoord</label><input id="rPw" type="password" autocomplete="new-password" placeholder="Minstens 8 tekens"></div>
+      <label class="check-row" for="rOk"><input id="rOk" type="checkbox"><span>Ik ben minstens 13 jaar en ga akkoord met de <a href="privacy.html" target="_blank" rel="noopener">privacyregels</a>.</span></label>
       <div class="err" id="authErr"></div>
       <button class="btn full" type="submit" id="authBtn">Account maken</button>
     </form>
@@ -242,6 +261,7 @@ async function doRegister() {
   if (!/^[a-z0-9_.]{3,20}$/.test(handle)) return fail("Gebruikersnaam: 3 tot 20 tekens, alleen letters, cijfers, punt of _.", "rHandle");
   if (!validEmail(email)) return fail("Dit e-mailadres klopt niet. Controleer het nog eens.", "rEmail");
   if (pw.length < 8) return fail("Je wachtwoord moet minstens 8 tekens hebben.", "rPw");
+  if (!$("rOk").checked) return fail("Vink aan dat je minstens 13 bent en akkoord gaat met de privacyregels.", "rOk");
   busyBtn("authBtn", true);
   try {
     const { data: free, error: e1 } = await sb.rpc("handle_available", { h: handle });
@@ -266,6 +286,7 @@ async function doLogin() {
 }
 async function afterLogin(isNew) {
   await loadProfile();
+  checkPush();
   if (isNew) toast(`Welkom bij Vlogit, ${me.name}`);
   const code = sessionStorage.getItem("vlogit-join");
   if (code) {
@@ -282,7 +303,7 @@ function viewHome() {
   let h = `<div class="top"><div class="logo" style="flex:1">Vlogit</div>
     <button class="iconbtn" data-act="nav" data-to="friends" aria-label="Vrienden">${ic("friends","s")}${fr.incoming.length?'<span class="dot"></span>':""}</button></div>`;
   if (!loaded.home) return h + `<section class="hero glass"><h1>${greet()}, ${esc(me.name)}.</h1></section>` + loader();
-  const due = groups.filter(g => turnOf(g) === me.id && !postedToday(g));
+  const due = groups.filter(g => turnOf(g) === me.id && !postedToday(g) && !jokerToday(g));
   if (due.length) {
     const g = due[0];
     h += `<section class="hero glass"><div class="label">Jij bent aan de beurt in ${esc(g.name)}</div><h1>${greet()}, ${esc(me.name)}.<br>Tijd om te vloggen.</h1>
@@ -296,6 +317,11 @@ function viewHome() {
   } else {
     h += `<section class="hero glass"><h1>${greet()}, ${esc(me.name)}.</h1><p class="muted" style="margin:0">Maak een groep met je vrienden, of join er een met een code.</p></section>`;
   }
+  if (+todayStr().slice(8, 10) <= 3) {
+    const lm = niceDate(lastMonthStart(), { month: "long" });
+    groups.forEach(g => { const w = reigning(g.id); if (w) h += `<div class="winner-card"><span class="em">👑</span>${av(w.user_id)}<div style="flex:1;min-width:0"><div class="label">Winnaar van ${lm} · ${esc(g.name)}</div><h2>${esc(shown(w.user_id))} ${w.user_id===me.id?"hebt":"heeft"} gewonnen</h2><span class="small muted">met een gemiddelde van ${fmt(w.avg_score)}</span></div></div>`; });
+  }
+  h += pushNotice();
   h += `<div class="sec"><h2>Mijn groepen</h2><button class="link" data-act="nav" data-to="join">Join met code</button></div>
     <div class="hscroll">${groups.map(gTile).join("")}
       <button class="tile new" data-act="nav" data-to="newgroup"><div class="art">${ic("plus")}</div><span class="nm">Nieuwe groep</span><span class="small muted">met je vrienden</span></button>
@@ -311,8 +337,10 @@ function viewHome() {
   return h;
 }
 function gTile(g) {
-  const t = turnOf(g), done = postedToday(g);
-  const badge = t === me.id ? (done ? `<span class="pill">${ic("check","s")} Geplaatst</span>` : `<span class="pill hot">Jouw beurt</span>`) : `<span class="pill">Vandaag: ${esc(nameOf(t))}</span>`;
+  const t = turnOf(g), done = postedToday(g), jk = jokerToday(g);
+  const badge = jk ? `<span class="pill">🃏 Joker van ${esc(shown(t))}</span>`
+    : t === me.id ? (done ? `<span class="pill">${ic("check","s")} Geplaatst</span>` : `<span class="pill hot">Jouw beurt</span>`)
+    : `<span class="pill">Vandaag: ${esc(nameOf(t))}</span>`;
   return `<button class="tile" data-act="open" data-id="${g.id}"><div class="art" style="background:${g.grad}">${badge}<div class="stack">${g.members.slice(0,4).map(m => av(m,"sm")).join("")}</div></div>
     <span class="nm">${esc(g.name)}</span><span class="small muted">${g.members.length} ${g.members.length===1?"lid":"leden"}</span></button>`;
 }
@@ -354,7 +382,7 @@ async function runSearch() {
   const q = search.q.replace(/^@/, "").trim().toLowerCase();
   if (q.length < 2) { search.results = []; $("searchRes") && ($("searchRes").innerHTML = searchHTML()); return; }
   const my = ++search.t; search.loading = true; $("searchRes").innerHTML = searchHTML();
-  const { data, error } = await sb.from("profiles").select("id,name,handle").ilike("handle", `%${q.replace(/[%_]/g, "\\$&")}%`).neq("id", me.id).limit(10);
+  const { data, error } = await sb.from("profiles").select(PSEL).ilike("handle", `%${q.replace(/[%_]/g, "\\$&")}%`).neq("id", me.id).limit(10);
   if (my !== search.t) return;
   search.loading = false;
   if (error) { toast(errMsg(error)); return; }
@@ -367,9 +395,104 @@ function viewProfile() {
   const posted = [...VL.values()].filter(v => v.author === me.id).length;
   return `<div class="top"><h1 style="flex:1">Profiel</h1></div>
     <div class="card" style="display:grid;justify-items:center;gap:8px;text-align:center;padding:26px 16px">
-      <span class="ring">${av(me.id,"lg")}</span><h2 style="font-size:28px">${esc(me.name)}</h2><span class="muted">@${esc(me.handle)}</span><span class="small muted" style="overflow-wrap:anywhere">${esc(session?.user?.email)}</span></div>
+      <span class="avatar-edit"><span class="ring">${av(me.id,"lg")}</span><label for="avatarFile" aria-label="Profielfoto kiezen">${ic("cam","s")}</label><input id="avatarFile" type="file" accept="image/*" hidden></span>
+      <h2 style="font-size:28px">${esc(me.name)}</h2><span class="muted">@${esc(me.handle)}</span><span class="small muted" style="overflow-wrap:anywhere">${esc(session?.user?.email)}</span></div>
     <div class="stats" style="margin-top:12px"><div class="glass"><b>${groups.length}</b><span class="small muted">groepen</span></div><div class="glass"><b>${fr.friends.length}</b><span class="small muted">vrienden</span></div><div class="glass"><b>${posted}</b><span class="small muted">vlogs</span></div></div>
-    <button class="btn soft full" style="margin-top:18px" data-act="logout">Uitloggen</button>`;
+    <div class="sec"><h2>Naam</h2></div>
+    <form class="card form" id="nameForm" novalidate><div class="field"><label class="label" for="pName">Naam die je vrienden zien</label><input id="pName" type="text" maxlength="30" value="${esc(me.name)}"></div><div class="err" id="authErr"></div><button class="btn soft" type="submit" id="nameBtn">Naam opslaan</button></form>
+    <div class="sec"><h2>Meldingen</h2></div>
+    <div class="card" style="display:grid;gap:10px">${pushPanel()}</div>
+    <div class="sec"><h2>Privacy</h2></div>
+    <div class="card" style="display:grid;gap:12px">
+      <p class="small muted" style="margin:0">Video's worden na 35 dagen automatisch gewist. Scores en het klassement blijven bewaard. Lees <a class="link" href="privacy.html" target="_blank" rel="noopener">de privacyregels</a>.</p>
+      <button class="btn soft" data-act="logout">Uitloggen</button>
+      ${confirmDelete
+        ? `<div class="card" style="display:grid;gap:10px;border-color:var(--warn)"><b class="danger">Alles verwijderen?</b><span class="small muted">Je account, je profielfoto, je vlogs met hun scores, je reacties en je vriendschappen worden voorgoed gewist. Dit kan je niet ongedaan maken.</span>
+           <div style="display:flex;gap:8px"><button class="btn soft" style="flex:1" data-act="deleteCancel">Annuleren</button><button class="btn" style="flex:1;background:var(--warn);color:#2a1d05" data-act="deleteAccount" id="delBtn">Ja, verwijder alles</button></div></div>`
+        : `<button class="link danger" style="justify-self:start" data-act="deleteAsk">Account verwijderen</button>`}
+    </div>`;
+}
+
+/* ---------- meldingen ---------- */
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+const standalone = () => window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+async function checkPush() {
+  try {
+    if (!pushSupported() || Notification.permission !== "granted") { pushOn = false; return; }
+    const reg = await navigator.serviceWorker.ready;
+    pushOn = !!(await reg.pushManager.getSubscription());
+  } catch (e) { pushOn = false; }
+}
+function pushNotice() {
+  if (pushOn || localStorageGet("vlogit-push-dismissed")) return "";
+  if (!pushSupported()) return isIOS && !standalone() ? `<div class="notice glass">${ic("sound")}<div class="t"><b>Mis je beurt niet</b><span class="small muted">Zet Vlogit eerst op je beginscherm (deelknop, Zet op beginscherm). Daarna kan je meldingen aanzetten.</span></div><button class="x" data-act="pushDismiss" aria-label="Sluiten">${ic("x","s")}</button></div>` : "";
+  if (Notification.permission === "denied") return "";
+  return `<div class="notice glass">${ic("sound")}<div class="t"><b>Mis je beurt niet</b><span class="small muted">Krijg een melding als jij aan de beurt bent en als er een nieuwe vlog is.</span></div><button class="btn sm" data-act="pushOn">Aanzetten</button></div>`;
+}
+function pushPanel() {
+  if (!pushSupported()) return `<span class="small muted">${isIOS && !standalone() ? "Op iPhone werken meldingen pas als Vlogit op je beginscherm staat. Open de app daarna vanaf je beginscherm." : "Deze browser ondersteunt geen meldingen."}</span>`;
+  if (Notification.permission === "denied") return `<span class="small muted">Je hebt meldingen geblokkeerd. Zet ze aan in de instellingen van je browser of gsm voor deze app.</span>`;
+  return pushOn
+    ? `<span class="small muted">Meldingen staan aan op dit toestel: jouw beurt (9 u), een herinnering (20 u), nieuwe vlogs en de winnaar van de maand.</span><button class="btn soft" data-act="pushOff">Meldingen uitzetten</button>`
+    : `<span class="small muted">Krijg een melding als jij aan de beurt bent, als er een nieuwe vlog is en wie de maand wint.</span><button class="btn" data-act="pushOn">Meldingen aanzetten</button>`;
+}
+function localStorageGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+const b64ToBytes = s => { const p = "=".repeat((4 - s.length % 4) % 4), b = atob((s + p).replace(/-/g, "+").replace(/_/g, "/")); return Uint8Array.from(b, c => c.charCodeAt(0)); };
+async function enablePush() {
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") { toast("Meldingen zijn niet toegestaan."); return; }
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(VAPID_PUBLIC_KEY) });
+  const j = sub.toJSON();
+  const { error } = await sb.from("push_subscriptions").upsert({ endpoint: j.endpoint, user_id: me.id, p256dh: j.keys.p256dh, auth: j.keys.auth }, { onConflict: "endpoint" });
+  if (error) throw error;
+  pushOn = true; toast("Meldingen staan aan."); render(true);
+}
+async function disablePush() {
+  const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription();
+  if (sub) { await sb.from("push_subscriptions").delete().eq("endpoint", sub.endpoint); await sub.unsubscribe(); }
+  pushOn = false; toast("Meldingen staan uit."); render(true);
+}
+
+/* ---------- profielfoto ---------- */
+async function uploadAvatar(file) {
+  if (!file || !file.type.startsWith("image/")) { toast("Kies een foto."); return; }
+  const img = await createImageBitmap(file).catch(() => null);
+  if (!img) { toast("Deze foto kan niet geopend worden."); return; }
+  const S = 320, c = document.createElement("canvas"); c.width = c.height = S;
+  const s = Math.min(img.width, img.height), ctx = c.getContext("2d");
+  ctx.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, S, S);
+  const blob = await new Promise(r => c.toBlob(r, "image/jpeg", 0.85));
+  const path = `${me.id}/${Date.now()}.jpg`;
+  toast("Foto uploaden…");
+  const up = await sb.storage.from("avatars").upload(path, blob, { contentType: "image/jpeg" });
+  if (up.error) throw up.error;
+  const url = sb.storage.from("avatars").getPublicUrl(path).data.publicUrl;
+  const old = me.avatar_url;
+  const { error } = await sb.from("profiles").update({ avatar_url: url }).eq("id", me.id);
+  if (error) throw error;
+  me.avatar_url = url; P[me.id] = me;
+  if (old && old.includes("/avatars/")) sb.storage.from("avatars").remove([old.split("/avatars/")[1]]);
+  toast("Profielfoto aangepast."); render(true);
+}
+
+/* ---------- account verwijderen ---------- */
+async function deleteAccount() {
+  busyBtn("delBtn", true);
+  const { data: mine } = await sb.from("vlogs").select("video_path").eq("author", me.id).not("video_path", "is", null);
+  const paths = (mine || []).map(v => v.video_path);
+  for (let i = 0; i < paths.length; i += 100) await sb.storage.from("vlogs").remove(paths.slice(i, i + 100));
+  const { data: av2 } = await sb.storage.from("avatars").list(me.id);
+  if (av2?.length) await sb.storage.from("avatars").remove(av2.map(f => `${me.id}/${f.name}`));
+  try { const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager?.getSubscription(); if (sub) await sub.unsubscribe(); } catch (e) {}
+  const { error } = await sb.rpc("delete_my_account");
+  if (error) { busyBtn("delBtn", false, "Ja, verwijder alles"); throw error; }
+  await sb.auth.signOut();
+  me = null; session = null; loaded = {}; VL.clear(); confirmDelete = false; view = { name: "welcome" }; render();
+  toast("Je account en al je gegevens zijn verwijderd.");
 }
 
 /* ---------- new group / join ---------- */
@@ -414,6 +537,7 @@ function gToday(g) {
     <div class="bar"><i data-clockbar></i></div>
     ${n > 1 ? `<div><div class="label" style="margin-bottom:6px">Volgende beurten</div><div class="rot">${rot.map((m,k) => `<div>${k===0?`<span class="ring">${av(m,"sm")}</span>`:av(m,"sm")}<span>${k===0?"vandaag":esc(shown(m))}</span></div>`).join("")}</div></div>` : ""}
   </section>`;
+  if (jokerToday(g)) return h + `<div class="card empty" style="margin-top:14px"><span style="font-size:34px">🃏</span><b>${who===me.id?"Je hebt je joker ingezet":esc(nameOf(who))+" zet vandaag een joker in"}</b><span class="small muted">Vandaag is er geen vlog, en deze dag telt voor niemand mee.</span></div>`;
   if (who !== me.id) {
     const tv = [...VL.values()].find(v => v.group_id === g.id && v.vlog_date === today);
     if (tv) return h + `<div class="sec"><h2>Vlog van vandaag</h2></div>${vlogCard(tv)}`;
@@ -424,7 +548,11 @@ function gToday(g) {
   if (!draft) return h + `<div class="drop glass">${ic("cam")}<h2>Maak je vlog</h2><span class="small muted">Film meteen in de app, of kies een video uit je galerij. Daarna bewerk je hem in de studio.</span>
     <div class="row2"><button class="btn full" data-act="camera">${ic("cam","s")} Filmen</button>
     <label class="btn soft full" for="file">${ic("upload","s")} Uit galerij kiezen</label><input id="file" type="file" accept="video/*" hidden></div>
-    <span class="small muted">Maximaal 50 MB per video. Filmen in de app houdt je video klein.</span></div>`;
+    <span class="small muted">Grote video's worden bij het plaatsen automatisch verkleind.</span></div>
+    <div class="card" style="margin-top:12px;display:grid;gap:10px">
+      <div style="display:flex;align-items:center;gap:10px"><span style="font-size:24px">🃏</span><div style="flex:1"><b>Joker</b><div class="small muted">${jokerUsed(g.id, me.id) ? "Je joker van deze maand is al op. Plaats je vlog voor middernacht, anders krijg je een 0." : "Geen tijd vandaag? Zet je joker in: je slaat je beurt over en deze dag telt niet mee. Je hebt 1 joker per maand."}</div></div></div>
+      ${jokerUsed(g.id, me.id) ? "" : `<button class="btn soft" data-act="joker" data-id="${g.id}">Joker inzetten</button>`}
+    </div>`;
   return h + `<section class="studio glass" aria-label="Studio">
     <div style="display:flex;justify-content:space-between;align-items:baseline"><h2>Studio</h2><span class="small muted mono" id="lenTxt"></span></div>
     <div class="stage" id="stage"><video id="pv" src="${draft.url}" playsinline preload="auto"></video><div id="capPrev"></div></div>
@@ -446,12 +574,17 @@ function vlogCard(v, showGroup) {
   const mine = v.author === me.id, myR = v.ratings.find(r => r.user_id === me.id)?.score;
   const scores = v.ratings.map(r => r.score), avg = scores.length ? scores.reduce((a,b)=>a+b,0)/scores.length : null;
   const watched = v.views.some(x => x.user_id === me.id) || mine, liked = v.likes.some(l => l.user_id === me.id);
-  const url = signed[v.video_path];
+  const url = v.video_path ? signed[v.video_path] : null;
   const len = e.end != null ? mmss((e.end - e.start) / (e.speed || 1)) : "";
+  const isToday = v.vlog_date === todayStr();
+  const avgTxt = isToday ? "na 00:00" : scores.length < 3 ? (scores.length ? "?" : "–") : fmt(avg);
+  const avgSub = isToday ? "scores verschijnen na middernacht" : scores.length < 3 ? `min. 3 scores nodig · ${scores.length}` : `/10 · ${scores.length} scores`;
+  const rx = EMOJIS.map(em => { const list = (v.reactions || []).filter(r => r.emoji === em), mineR = list.some(r => r.user_id === me.id);
+    return `<button data-act="emoji" data-id="${v.id}" data-e="${em}" aria-pressed="${mineR}" aria-label="Reageer met ${em}">${em}${list.length ? `<span>${list.length}</span>` : ""}</button>`; }).join("");
   return `<article class="vlog glass" id="card-${v.id}">
-    <div class="vlog-head">${av(v.author,"sm")}<div class="t"><b>${esc(shown(v.author))}</b><span class="small muted">${showGroup&&g?esc(g.name)+" · ":""}${niceDate(v.vlog_date,{day:"numeric",month:"long"})} · ${esc(v.title)}</span></div></div>
+    <div class="vlog-head">${av(v.author,"sm")}<div class="t"><b>${esc(shown(v.author))}${crown(v.author, v.group_id)}</b><span class="small muted">${showGroup&&g?esc(g.name)+" · ":""}${niceDate(v.vlog_date,{day:"numeric",month:"long"})} · ${esc(v.title)}</span></div></div>
     <div class="poster" id="stage-${v.id}" style="background:${GRADS[hash(v.id)%GRADS.length]}">
-      ${url ? `<video id="vid-${v.id}" src="${url}#t=${(e.start||0)+0.1}" playsinline preload="metadata" style="filter:${FILTERS[e.filter]||"none"}"></video>${capHTML(e)}` : `<div class="ttl">${esc(v.title)}</div>`}
+      ${url ? `<video id="vid-${v.id}" src="${url}#t=${(e.start||0)+0.1}" playsinline preload="metadata" style="filter:${FILTERS[e.filter]||"none"}"></video>${capHTML(e)}` : `<div class="ttl">${esc(v.title)}${v.video_path ? "" : `<div class="small" style="font-family:var(--body);margin-top:8px;opacity:.85">Video gewist na 35 dagen</div>`}</div>`}
       ${len ? `<span class="tc">${len}</span>` : ""}${e.music && TRACKS[e.music] ? `<span class="pill mus">${ic("music","s")} ${TRACKS[e.music].label}</span>` : ""}
       ${url ? `<button class="play" data-act="play" data-id="${v.id}" aria-label="Vlog van ${esc(shown(v.author))} afspelen">${ic("play")}</button>` : ""}
       <div class="prog"><i id="prog-${v.id}" style="width:${watched?100:0}%"></i></div></div>
@@ -459,12 +592,13 @@ function vlogCard(v, showGroup) {
       <div class="actions">
         <button class="act" data-act="like" data-id="${v.id}" aria-pressed="${liked}">${ic("heart")}<span>${v.likes.length}</span></button>
         <span class="act">${ic("chat")}<span>${v.comments.length}</span></span>
-        <div class="avg"><span class="small muted">gem.</span><b>${(mine||myR!=null)?fmt(avg):"?"}</b><span class="small muted">/10 · ${scores.length}</span></div>
+        <div class="avg" title="${avgSub}"><span class="small muted">gem.</span><b>${avgTxt}</b></div>
       </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><div class="emojis">${rx}</div><span class="small muted">${avgSub}</span></div>
       ${mine ? `<div class="lock">Je eigen vlog kan je niet scoren.</div>` :
       `<div class="field"><span class="label">${myR!=null?"Jouw score":"Geef een score"}</span>
         <div class="rate" role="group" aria-label="Score van 1 tot 10">${[1,2,3,4,5,6,7,8,9,10].map(n => `<button data-act="rate" data-id="${v.id}" data-n="${n}" aria-pressed="${myR===n}" ${watched?"":"disabled"}>${n}</button>`).join("")}</div>
-        ${watched ? "" : `<div class="lock">${ic("lock","s")} Bekijk de vlog eerst helemaal om te scoren.</div>`}</div>`}
+        ${watched ? "" : `<div class="lock">${ic("lock","s")} ${v.video_path ? "Bekijk de vlog eerst helemaal om te scoren." : "Deze video is niet meer beschikbaar."}</div>`}</div>`}
       ${v.comments.length ? `<div class="comments">${v.comments.map(c => `<p><b>${esc(shown(c.user_id))}</b>${esc(c.body)}</p>`).join("")}</div>` : ""}
       <form class="cform" data-comment="${v.id}"><input id="c-${v.id}" type="text" maxlength="500" placeholder="Reageer…" aria-label="Reactie"><button type="submit">Plaats</button></form>
     </div></article>`;
@@ -474,14 +608,18 @@ function refreshCard(id) {
   document.querySelectorAll("#card-" + CSS.escape(id)).forEach(el => { el.outerHTML = vlogCard(v, view.name === "home"); });
 }
 function gRank(g) {
-  const rows = (lb[g.id] || []).map(r => ({ n: r.user_id, count: r.vlogs, votes: r.votes, avg: r.avg_score == null ? null : Number(r.avg_score) }));
+  const rows = (lb[g.id] || []).map(r => ({ n: r.user_id, count: r.vlogs, votes: r.votes, missed: r.missed || 0, avg: r.avg_score == null ? null : Number(r.avg_score) }));
+  const hof = winners[g.id] || [];
   const today = todayStr(), last = new Date(Date.UTC(+today.slice(0,4), +today.slice(5,7), 0)).getUTCDate(), left = last - +today.slice(8,10);
   const mon = niceDate(today, { month: "long" });
   const top = rows.slice(0, 3), order = [top[1], top[0], top[2]];
   const pod = top.length >= 3 && top[2].avg != null ? `<div class="podium">${order.map((r,k) => { const p = [2,1,3][k]; return `<div class="pod p${p}">${p===1?`<span class="ring">${av(r.n)}</span>`:av(r.n,"sm")}<span class="n">${esc(shown(r.n))}</span><div class="blk"><b>${fmt(r.avg)}</b><span class="small" style="opacity:.75">#${p}</span></div></div>`; }).join("")}</div>` : "";
   return `<div class="card" style="display:grid;gap:14px;margin-top:6px"><div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px"><h2 style="text-transform:capitalize">${mon}</h2><span class="small muted">nog ${left} ${left===1?"dag":"dagen"}</span></div>${pod}</div>
-    <div class="card" style="margin-top:12px"><ol class="rank">${rows.map((r,k) => `<li><span class="pos">${k+1}</span>${av(r.n,"sm")}<div><b>${esc(shown(r.n))}</b><small>${r.count} vlog${r.count===1?"":"s"} · ${r.votes} scores</small><div class="meter"><i style="width:${(r.avg??0)*10}%"></i></div></div><span class="sc">${fmt(r.avg)}</span></li>`).join("")}</ol></div>
-    <p class="small muted">Je score is het gemiddelde van alle scores die je deze maand kreeg. De winnaar wordt bekend op ${last} ${mon} om middernacht.</p>`;
+    <div class="card" style="margin-top:12px"><ol class="rank">${rows.map((r,k) => `<li><span class="pos">${k+1}</span>${av(r.n,"sm")}<div><b>${esc(shown(r.n))}${crown(r.n, g.id)}</b><small>${r.count} vlog${r.count===1?"":"s"} · ${r.votes} scores${r.missed?` · <span class="danger">${r.missed} gemist</span>`:""}${jokerUsed(g.id, r.n)?" · 🃏 gebruikt":""}</small><div class="meter"><i style="width:${(r.avg??0)*10}%"></i></div></div><span class="sc">${fmt(r.avg)}</span></li>`).join("")}</ol></div>
+    <p class="small muted">Je score is het gemiddelde van alle scores die je deze maand kreeg. Een gemiste beurt telt als een 0. Scores van vandaag tellen pas mee na middernacht. De winnaar wordt bekend op 1 ${niceDate(addDays(today, last - +today.slice(8,10) + 1), { month: "long" })}.</p>
+    <div class="sec"><h2>Hall of fame</h2><span class="small muted">👑</span></div>
+    ${hof.length ? `<div class="card"><ul class="hof">${hof.map(w => `<li>${av(w.user_id,"sm")}<div class="t"><b>${niceDate(w.month,{month:"long",year:"numeric"})}</b><span class="small muted">${esc(shown(w.user_id))}</span></div><span class="sc mono" style="font-weight:700">${fmt(w.avg_score)}</span></li>`).join("")}</ul></div>`
+      : `<div class="card small muted">Hier komen de winnaars van elke maand. De eerste kroon wordt uitgedeeld op 1 ${niceDate(addDays(today, last - +today.slice(8,10) + 1), { month: "long" })}.</div>`}`;
 }
 function gMembers(g) {
   const today = todayStr(), n = g.members.length;
@@ -497,11 +635,12 @@ function gMembers(g) {
     <div class="sec"><h2>Spelregels</h2></div>
     <div class="card"><ol class="rules">
       <li>Elke dag is één iemand aan de beurt, in vaste volgorde.</li>
-      <li>Je hebt tot middernacht om je vlog te plaatsen.</li>
-      <li>Bewerken doe je in de studio van de app.</li>
-      <li>Pas na het volledig bekijken kan je scoren van 1 tot 10.</li>
-      <li>Je eigen vlog scoren kan niet.</li>
-      <li>Op het einde van de maand wint het hoogste gemiddelde.</li></ol></div>
+      <li>Je hebt tot middernacht om je vlog te plaatsen. Mis je je beurt, dan krijg je een 0.</li>
+      <li>Je hebt 1 joker per maand om je beurt over te slaan. Die dag telt dan niet mee.</li>
+      <li>Pas na het volledig bekijken kan je scoren van 1 tot 10. Je eigen vlog scoren kan niet.</li>
+      <li>Scores blijven geheim tot middernacht. Het gemiddelde verschijnt vanaf 3 scores.</li>
+      <li>Op het einde van de maand wint het hoogste gemiddelde en krijgt een 👑.</li>
+      <li>Video's worden na 35 dagen gewist. Scores blijven bewaard.</li></ol></div>
     <button class="btn soft full" style="margin-top:16px" data-act="leave" data-id="${g.id}">Groep verlaten</button>`;
 }
 
@@ -567,7 +706,8 @@ function closeRecorder() {
 const TOOLS = [["trim","Knippen","cut"],["filter","Filters","filter"],["text","Tekst","text"],["music","Muziek","music"],["sfx","Geluidjes","sound"],["speed","Snelheid","speed"],["mix","Volume","mix"]];
 function loadDraft(blob, knownDur) {
   if (!blob || !blob.size) { toast("De opname is leeg. Probeer opnieuw."); return; }
-  if (blob.size > MAX_BYTES) { toast(`Deze video is ${Math.round(blob.size/1048576)} MB. Het maximum is 50 MB. Film in de app of kies een kortere video.`); return; }
+  if (blob.size > 1500 * 1048576) { toast(`Deze video is ${Math.round(blob.size/1048576)} MB, dat is te groot om te verkleinen. Kies een kortere video.`); return; }
+  if (blob.size > MAX_BYTES) toast(`Deze video is ${Math.round(blob.size/1048576)} MB. Hij wordt bij het plaatsen automatisch verkleind.`);
   const url = URL.createObjectURL(blob), probe = document.createElement("video");
   probe.preload = "metadata"; probe.muted = true; probe.src = url;
   const ready = dur => {
@@ -601,12 +741,25 @@ async function publish() {
   if (publishing) return;
   stopEdit(); const g = groupById(view.id); if (!g || !draft) return;
   publishing = true; const btn = $("publish"); btn.disabled = true; btn.innerHTML = `<span class="spin"></span> Uploaden…`;
-  const type = (draft.type || "video/mp4").split(";")[0];
+  let { blob, url, ...rest } = draft;
+  let type = (draft.type || "video/mp4").split(";")[0];
+  let start = rest.start, end = rest.end, dur = rest.dur, sfx = rest.sfx.map(s => ({ ...s }));
+  try {
+    if (blob.size > MAX_BYTES) {
+      // Verklein alleen het stuk dat je hebt gehouden, op ongeveer 720p
+      btn.innerHTML = `<span class="spin"></span> Verkleinen… 0%`;
+      const out = await compressRange(url, start, end, p => { btn.innerHTML = `<span class="spin"></span> Verkleinen… ${Math.round(p * 100)}%`; });
+      if (out.blob.size > MAX_BYTES) throw new Error("Ook verkleind is deze video groter dan 50 MB. Knip hem korter.");
+      blob = out.blob; type = out.blob.type || "video/webm";
+      sfx = sfx.map(s => ({ ...s, t: Math.max(0, s.t - start) })); dur = out.dur; start = 0; end = out.dur;
+      url = URL.createObjectURL(blob);
+      btn.innerHTML = `<span class="spin"></span> Uploaden…`;
+    }
+  } catch (e) { publishing = false; btn.disabled = false; btn.textContent = "Plaatsen"; toast(errMsg(e)); return; }
   const ext = type.includes("webm") ? "webm" : type.includes("quicktime") ? "mov" : "mp4";
   const path = `${g.id}/${crypto.randomUUID()}.${ext}`;
-  const { blob, url, ...rest } = draft;
-  const edit = { start: rest.start, end: rest.end, dur: rest.dur, filter: rest.filter, caption: rest.caption.trim(), textStyle: rest.textStyle, textPos: rest.textPos,
-    music: rest.music, musicVol: rest.musicVol, origVol: rest.origVol, sfxVol: rest.sfxVol, speed: rest.speed, sfx: rest.sfx };
+  const edit = { start, end, dur, filter: rest.filter, caption: rest.caption.trim(), textStyle: rest.textStyle, textPos: rest.textPos,
+    music: rest.music, musicVol: rest.musicVol, origVol: rest.origVol, sfxVol: rest.sfxVol, speed: rest.speed, sfx };
   try {
     const up = await sb.storage.from("vlogs").upload(path, blob, { contentType: type, upsert: false });
     if (up.error) throw up.error;
@@ -616,10 +769,53 @@ async function publish() {
     groupIds[g.id] = [ins.data.id, ...(groupIds[g.id] || [])];
     draft = null; publishing = false; gtab = "feed"; render();
     toast("Geplaatst. Je vrienden kunnen nu kijken en scoren.");
+    sb.functions.invoke(JOBS_FUNCTION, { body: { type: "new_vlog", vlog_id: ins.data.id } }).catch(() => {});
     signed[path] = undefined; await signUrls([path]);
   } catch (e) {
     publishing = false; btn.disabled = false; btn.textContent = "Plaatsen"; toast(errMsg(e));
   }
+}
+// Speelt het gekozen stuk af in een onzichtbare speler en neemt het opnieuw op, kleiner
+function compressRange(srcUrl, start, end, onProg) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    v.playsInline = true; v.preload = "auto"; v.src = srcUrl;
+    const c = document.createElement("canvas"), ctx = c.getContext("2d");
+    const actx = ac();
+    let mr, chunks = [], t0 = 0, done = false, raf = 0;
+    const fail = msg => { if (done) return; done = true; cancelAnimationFrame(raf); try { v.pause(); } catch (e) {} reject(new Error(msg)); };
+    v.onerror = () => fail("Deze video kan niet verkleind worden in deze browser. Kies een kortere video of film in de app.");
+    v.onloadedmetadata = () => {
+      const scale = Math.min(1, 1280 / Math.max(v.videoWidth || 720, v.videoHeight || 1280));
+      c.width = Math.round((v.videoWidth || 720) * scale / 2) * 2; c.height = Math.round((v.videoHeight || 1280) * scale / 2) * 2;
+      let stream;
+      try {
+        stream = c.captureStream(30);
+        const src = actx.createMediaElementSource(v), dest = actx.createMediaStreamDestination();
+        src.connect(dest);
+        dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+        const type = REC_TYPES.find(t => MediaRecorder.isTypeSupported(t)) || "";
+        mr = new MediaRecorder(stream, { mimeType: type || undefined, videoBitsPerSecond: 1_800_000, audioBitsPerSecond: 96_000 });
+      } catch (e) { return fail("Verkleinen lukt niet in deze browser. Kies een kortere video of film in de app."); }
+      mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+      mr.onstop = () => { const blob = new Blob(chunks, { type: (mr.mimeType || "video/webm").split(";")[0] }); resolve({ blob, dur: (performance.now() - t0) / 1000 }); };
+      if (start < 0.05) v.onseeked(); else v.currentTime = start;
+    };
+    v.onseeked = () => {
+      if (mr.state !== "inactive" || done) return;
+      v.play().then(() => {
+        mr.start(1000); t0 = performance.now();
+        const draw = () => {
+          if (done) return;
+          ctx.drawImage(v, 0, 0, c.width, c.height);
+          onProg(Math.min(1, (v.currentTime - start) / (end - start)));
+          if (v.currentTime >= end || v.ended) { done = true; v.pause(); mr.stop(); return; }
+          raf = requestAnimationFrame(draw);
+        };
+        draw();
+      }).catch(() => fail("Afspelen voor het verkleinen lukte niet. Probeer opnieuw en laat je scherm aan."));
+    };
+  });
 }
 function setPlayIcon(on) { const b = $("pvPlay"); if (b) { b.innerHTML = ic(on ? "stop" : "play"); b.setAttribute("aria-label", on ? "Stoppen" : "Voorbeeld afspelen"); } }
 function applyLook() {
@@ -650,7 +846,7 @@ function drawPanel() {
       <div class="field"><span class="label">Stijl</span><div class="opts" data-group="textStyle">${Object.entries(TEXTSTYLES).map(([k,l]) => `<button data-v="${k}" aria-pressed="${d.textStyle===k}">${l}</button>`).join("")}</div></div>
       <div class="field"><span class="label">Plaats</span><div class="opts" data-group="textPos">${Object.entries(TEXTPOS).map(([k,l]) => `<button data-v="${k}" aria-pressed="${d.textPos===k}">${l}</button>`).join("")}</div></div>`,
     music: () => `<div class="tracks"><button class="track" data-v="" aria-pressed="${!d.music}"><span class="art" style="background:var(--raise)">${ic("x","s")}</span><span class="t"><b>Geen muziek</b><span class="small muted">Alleen het geluid van je video</span></span></button>
-      ${Object.entries(TRACKS).map(([k,t]) => `<button class="track" data-v="${k}" aria-pressed="${d.music===k}"><span class="art" style="background:${t.art}">${ic("music","s")}</span><span class="t"><b>${t.label}</b><span class="small muted">${t.sub}</span></span>${d.music===k?ic("check","s"):""}</button>`).join("")}</div>`,
+      ${Object.entries(TRACKS).map(([k,t]) => `<button class="track" data-v="${k}" aria-pressed="${d.music===k}"><span class="art" style="background:${t.art}">${ic("music","s")}</span><span class="t"><b>${t.label}</b><span class="small muted">${t.file ? "Echt nummer" : t.sub}</span></span>${d.music===k?ic("check","s"):""}</button>`).join("")}</div>`,
     sfx: () => R("at","Moment in je video",d.start,d.end,.1,at,mmss(at)) +
       `<div class="sfxgrid">${Object.entries(SFX).map(([k,s]) => `<button class="sfx" data-v="${k}"><span>${s.emo}</span>${s.label}</button>`).join("")}</div>
       <p class="small muted" style="margin:0">Kies een moment en tik op een geluidje om het daar te plaatsen.</p>
@@ -764,6 +960,24 @@ document.addEventListener("click", async ev => {
       if (navigator.share) { try { await navigator.share({ title: "Vlogit", text, url: link }); } catch (e) {} }
       else { try { await navigator.clipboard.writeText(text); toast("Uitnodigingslink gekopieerd"); } catch (e) { toast(link); } }
     }
+    else if (A === "joker") {
+      if (t.dataset.sure !== "1") { t.dataset.sure = "1"; t.textContent = "Zeker? Tik nog eens om je joker in te zetten"; return; }
+      const { error } = await sb.rpc("use_joker", { p_group: id });
+      if (error) throw error;
+      jokers.push({ group_id: id, user_id: me.id, day: todayStr() }); toast("Joker ingezet. Vandaag telt niet mee."); render(true);
+    }
+    else if (A === "emoji") {
+      const v = VL.get(id), em = t.dataset.e, has = (v.reactions || []).some(r => r.user_id === me.id && r.emoji === em);
+      if (has) { const { error } = await sb.from("reactions").delete().eq("vlog_id", id).eq("user_id", me.id).eq("emoji", em); if (error) throw error; v.reactions = v.reactions.filter(r => !(r.user_id === me.id && r.emoji === em)); }
+      else { const { error } = await sb.from("reactions").insert({ vlog_id: id, user_id: me.id, emoji: em }); if (error) throw error; (v.reactions = v.reactions || []).push({ user_id: me.id, emoji: em }); }
+      refreshCard(id);
+    }
+    else if (A === "pushOn") await enablePush();
+    else if (A === "pushOff") await disablePush();
+    else if (A === "pushDismiss") { localStorageSet("vlogit-push-dismissed", "1"); render(true); }
+    else if (A === "deleteAsk") { confirmDelete = true; render(true); }
+    else if (A === "deleteCancel") { confirmDelete = false; render(true); }
+    else if (A === "deleteAccount") await deleteAccount();
     else if (A === "logout") { stopEdit(); await sb.auth.signOut(); me = null; session = null; loaded = {}; VL.clear(); view = { name: "welcome" }; render(); }
   } catch (e) { toast(errMsg(e)); }
 });
@@ -787,6 +1001,14 @@ document.addEventListener("submit", async ev => {
       if (error) { busyBtn("joinBtn", false, "Joinen"); return fail(/bestaat niet/.test(error.message) ? "Deze code bestaat niet. Vraag de code opnieuw aan je vriend." : errMsg(error), "jCode"); }
       toast("Je zit nu in de groep."); await go("group", { id: gid });
     }
+    else if (f.id === "nameForm") {
+      const name = val("pName"); if (!name) return fail("Vul een naam in.", "pName");
+      busyBtn("nameBtn", true);
+      const { error } = await sb.from("profiles").update({ name }).eq("id", me.id);
+      busyBtn("nameBtn", false, "Naam opslaan");
+      if (error) throw error;
+      me.name = name; P[me.id] = me; toast("Naam opgeslagen."); render(true);
+    }
     else if (f.dataset.comment) {
       const id = f.dataset.comment, inp = $("c-" + id), body = inp.value.trim(); if (!body) return;
       const { data, error } = await sb.from("comments").insert({ vlog_id: id, user_id: me.id, body }).select("id,user_id,body,created_at").single();
@@ -794,6 +1016,9 @@ document.addEventListener("submit", async ev => {
       VL.get(id).comments.push(data); refreshCard(id);
     }
   } catch (e) { toast(errMsg(e)); }
+});
+document.addEventListener("change", ev => {
+  if (ev.target.id === "avatarFile" && ev.target.files[0]) uploadAvatar(ev.target.files[0]).catch(e => toast(errMsg(e)));
 });
 document.addEventListener("input", ev => {
   if (ev.target.id === "search") { search.q = ev.target.value; clearTimeout(search.d); search.d = setTimeout(runSearch, 250); }
@@ -806,6 +1031,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
   if (qp.get("join")) { sessionStorage.setItem("vlogit-join", qp.get("join").toUpperCase()); history.replaceState(null, "", location.pathname); }
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
   render();
+  musicReady.then(() => { if (draft && tool === "music") drawPanel(); });
   try {
     const { data } = await sb.auth.getSession();
     session = data.session;
