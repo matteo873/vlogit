@@ -85,15 +85,23 @@ export const musicReady = Promise.all(Object.keys(TRACKS).map(async id => {
   } catch (e) {}
 }));
 
+// id is de naam van een ingebouwd deuntje, of {url, offset} voor eigen muziek
 export function startMusic(id, vol) {
-  stopMusic(); if (!id || !TRACKS[id]) return;
-  const tr = TRACKS[id];
-  if (tr.file) {
-    const a = new Audio(tr.file); a.loop = true; a.volume = Math.min(1, vol);
+  stopMusic(); if (!id) return;
+  const custom = typeof id === "object" ? id : null;
+  if (!custom && !TRACKS[id]) return;
+  const file = custom ? custom.url : TRACKS[id].file;
+  if (file) {
+    const a = new Audio(file); a.loop = true; a.volume = Math.min(1, vol);
+    if (custom && custom.offset) {
+      const seek = () => { try { a.currentTime = custom.offset % (isFinite(a.duration) && a.duration > 0 ? a.duration : 1e9); } catch (e) {} };
+      if (a.readyState >= 1) seek(); else a.addEventListener("loadedmetadata", seek, { once: true });
+    }
     a.play().catch(() => {});
     music = { audio: a, g: { gain: { set value(v) { a.volume = Math.min(1, v); } } } };
     return;
   }
+  const tr = TRACKS[id];
   const c = ac(), g = c.createGain(); g.gain.value = vol; g.connect(c.destination);
   const spb = 60 / tr.bpm / 4; let step = 0, next = c.currentTime + .06;
   const iv = setInterval(() => { while (next < c.currentTime + .15) { playStep(tr, step, next, g, spb); next += spb; step = (step + 1) % 64; } }, 30);
@@ -117,16 +125,27 @@ export function playEdit(el, cfg, stageEl, onProg, onDone, onFail) {
   el.currentTime = cfg.start; el.playbackRate = cfg.speed || 1;
   el.volume = cfg.origVol ?? 1; el.muted = (cfg.origVol ?? 1) === 0;
   const out = c.createGain(); out.gain.value = cfg.sfxVol ?? .9; out.connect(c.destination);
-  startMusic(cfg.music, cfg.musicVol ?? .5);
+  // muziek: ingebouwd deuntje, of een nummer (met beginpunt; bij filmen-met-muziek loopt het mee met het knippen)
+  const isFile = cfg.music === "sound" || cfg.music === "custom";
+  const offset = (cfg.musicOffset || 0) + (cfg.musicSync ? cfg.start : 0);
+  startMusic(isFile ? (cfg.musicUrl ? { url: cfg.musicUrl, offset } : null) : cfg.music, cfg.musicVol ?? .5);
+  // ingesproken stem
+  let voice = null;
+  if (cfg.voiceUrl) { voice = new Audio(cfg.voiceUrl); voice.volume = Math.min(1, cfg.voiceVol ?? 1); voice.play().catch(() => {}); }
+  // eigen geluidseffecten vooraf laden
+  const sfxEls = (cfg.sfx || []).map(s => { if (!s.url) return null; const a = new Audio(s.url); a.preload = "auto"; return a; });
   const fired = new Set(); let last = cfg.start - .01;
-  fx = { el, raf: 0, out };
+  fx = { el, raf: 0, out, voice, sfxEls };
   const loop = () => {
     if (!fx || fx.el !== el) return;
     const t = el.currentTime;
     (cfg.sfx || []).forEach((s, i) => {
-      if (!fired.has(i) && s.t > last && s.t <= t + .03 && SFX[s.type]) {
-        fired.add(i); SFX[s.type].fn(out, c.currentTime);
-        if (stageEl) { const b = document.createElement("div"); b.className = "burst"; b.textContent = SFX[s.type].emo + " " + SFX[s.type].label; stageEl.appendChild(b); setTimeout(() => b.remove(), 900); }
+      if (!fired.has(i) && s.t > last && s.t <= t + .03 && (SFX[s.type] || sfxEls[i])) {
+        fired.add(i);
+        let label;
+        if (sfxEls[i]) { const a = sfxEls[i]; a.volume = Math.min(1, cfg.sfxVol ?? .9); a.currentTime = 0; a.play().catch(() => {}); label = "🔊 " + (s.name || "Geluid"); }
+        else { SFX[s.type].fn(out, c.currentTime); label = SFX[s.type].emo + " " + SFX[s.type].label; }
+        if (stageEl) { const b = document.createElement("div"); b.className = "burst"; b.textContent = label; stageEl.appendChild(b); setTimeout(() => b.remove(), 900); }
       }
     });
     last = t; onProg && onProg(t);
@@ -140,12 +159,15 @@ export function stopEdit() {
   if (!fx) return;
   cancelAnimationFrame(fx.raf);
   try { fx.el.pause(); } catch (e) {}
+  if (fx.voice) { fx.voice.pause(); fx.voice.src = ""; }
+  (fx.sfxEls || []).forEach(a => { if (a) { a.pause(); a.src = ""; } });
   fx.out.disconnect(); stopMusic(); fx = null;
 }
 export const playingOn = el => !!fx && fx.el === el;
-export function liveSet({ musicVol, sfxVol, origVol, speed }) {
+export function liveSet({ musicVol, sfxVol, origVol, speed, voiceVol }) {
   if (musicVol != null && music) music.g.gain.value = musicVol;
   if (!fx) return;
+  if (voiceVol != null && fx.voice) fx.voice.volume = Math.min(1, voiceVol);
   if (sfxVol != null) fx.out.gain.value = sfxVol;
   if (origVol != null) { fx.el.volume = origVol; fx.el.muted = origVol === 0; }
   if (speed != null) fx.el.playbackRate = speed;

@@ -23,6 +23,8 @@ let jokers = [];                          // {group_id,user_id,day} van deze maa
 const winners = {};                       // per groep: [{month,user_id,avg_score}]
 let pushOn = false, confirmDelete = false, compressing = null;
 const EMOJIS = ["😂", "🔥", "😮", "👏"];
+const lib = {};                           // gedeelde geluiden per groep: [{id,user_id,name,kind,path,duration}]
+let voiceRec = null, fxRec = null;        // lopende opnames (stem / eigen geluid)
 const PSEL = "id,name,handle,avatar_url";
 
 const TEXTSTYLES = { serif: "Sierlijk", bold: "Dik", type: "Typmachine" };
@@ -56,7 +58,8 @@ const ICON = {
   music:'<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
   sound:'<path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/>',
   speed:'<path d="M12 14l4-4"/><path d="M3.3 17a9 9 0 1 1 17.4 0"/>',
-  mix:'<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>'
+  mix:'<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+  mic:'<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8"/>'
 };
 const ic = (n, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICON[n]}</svg>`;
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -153,7 +156,7 @@ async function loadVlogs(ids, limit) {
     .order("vlog_date", { ascending: false }).limit(limit);
   if (error) throw error;
   data.forEach(v => { v.comments.sort((a, b) => a.created_at.localeCompare(b.created_at)); VL.set(v.id, v); });
-  await signUrls(data.map(v => v.video_path).filter(Boolean));
+  await signUrls(data.flatMap(v => v.video_path ? [v.video_path, v.edit?.musicPath, v.edit?.voicePath, ...(v.edit?.sfx || []).map(s => s.path)] : []).filter(Boolean));
   return data.map(v => v.id);
 }
 async function signUrls(paths) {
@@ -161,6 +164,42 @@ async function signUrls(paths) {
   if (!need.length) return;
   const { data, error } = await sb.storage.from("vlogs").createSignedUrls(need, 6 * 3600);
   if (!error && data) data.forEach(d => { if (d.signedUrl) signed[d.path] = d.signedUrl; });
+}
+async function loadLibrary(gid) {
+  const { data, error } = await sb.from("sounds").select("id,user_id,name,kind,path,duration,created_at").eq("group_id", gid).order("created_at", { ascending: false });
+  if (error) { lib[gid] = lib[gid] || []; return; }
+  lib[gid] = data; await signUrls(data.map(s => s.path));
+}
+const soundById = (gid, id) => (lib[gid] || []).find(s => s.id === id);
+async function uploadSound(gid, file, kind, name, duration) {
+  const path = `${gid}/sounds/${crypto.randomUUID()}.${musicExt(file)}`;
+  const up = await sb.storage.from("vlogs").upload(path, file, { contentType: musicType(file), upsert: false });
+  if (up.error) throw up.error;
+  const { data, error } = await sb.from("sounds").insert({ group_id: gid, user_id: me.id, name: name.slice(0, 60), kind, path, duration }).select("id,user_id,name,kind,path,duration,created_at").single();
+  if (error) { await sb.storage.from("vlogs").remove([path]); throw error; }
+  (lib[gid] = lib[gid] || []).unshift(data);
+  signed[path] = URL.createObjectURL(file);
+  return data;
+}
+async function deleteSound(gid, id) {
+  const s = soundById(gid, id); if (!s) return;
+  const { error } = await sb.from("sounds").delete().eq("id", id);
+  if (error) throw error;
+  await sb.storage.from("vlogs").remove([s.path]);
+  lib[gid] = lib[gid].filter(x => x.id !== id);
+}
+const probeDuration = url => new Promise(res => { const a = new Audio(); a.preload = "metadata"; a.onloadedmetadata = () => res(isFinite(a.duration) ? a.duration : 0); a.onerror = () => res(-1); a.src = url; });
+const AUDIO_REC_TYPES = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
+async function recordAudio() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  const type = AUDIO_REC_TYPES.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+  const mr = new MediaRecorder(stream, type ? { mimeType: type, audioBitsPerSecond: 96_000 } : undefined);
+  const chunks = []; mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  const done = new Promise(res => { mr.onstop = () => { stream.getTracks().forEach(t => t.stop());
+    const base = (mr.mimeType || type || "audio/webm").split(";")[0];
+    res(new File(chunks, `opname.${base.includes("mp4") ? "m4a" : base.includes("ogg") ? "ogg" : "webm"}`, { type: base })); }; });
+  mr.start(500);
+  return { mr, stream, t0: Date.now(), done, stop: () => { if (mr.state !== "inactive") mr.stop(); } };
 }
 async function loadLeaderboard(id) {
   const { data, error } = await sb.rpc("leaderboard", { p_group: id });
@@ -170,7 +209,7 @@ async function loadLeaderboard(id) {
 
 /* ================= navigation ================= */
 async function go(name, extra = {}) {
-  stopEdit(); closeRecorder();
+  stopEdit(); closeRecorder(); stopVoiceRec();
   view = { name, ...extra };
   if (name === "group") gtab = extra.tab || "today";
   draft = null; render();
@@ -189,7 +228,7 @@ async function refresh() {
       await Promise.all([loadGroups(), loadFriends()]);
       if (!groupById(view.id)) { toast("Deze groep bestaat niet meer."); return go("home"); }
       groupIds[view.id] = await loadVlogs([view.id], 62);
-      await loadLeaderboard(view.id);
+      await Promise.all([loadLeaderboard(view.id), loadLibrary(view.id)]);
     }
     loaded[v === "group" ? "g:" + view.id : v] = true;
   } catch (e) { toast(errMsg(e)); }
@@ -482,8 +521,10 @@ async function uploadAvatar(file) {
 /* ---------- account verwijderen ---------- */
 async function deleteAccount() {
   busyBtn("delBtn", true);
-  const { data: mine } = await sb.from("vlogs").select("video_path").eq("author", me.id).not("video_path", "is", null);
-  const paths = (mine || []).map(v => v.video_path);
+  const { data: mine } = await sb.from("vlogs").select("video_path,edit").eq("author", me.id).not("video_path", "is", null);
+  const { data: mySounds } = await sb.from("sounds").select("path").eq("user_id", me.id);
+  const paths = [...(mine || []).flatMap(v => [v.video_path, v.edit?.voicePath, v.edit?.musicPath && !v.edit.musicPath.includes("/sounds/") ? v.edit.musicPath : null]),
+    ...(mySounds || []).map(s => s.path)].filter(Boolean);
   for (let i = 0; i < paths.length; i += 100) await sb.storage.from("vlogs").remove(paths.slice(i, i + 100));
   const { data: av2 } = await sb.storage.from("avatars").list(me.id);
   if (av2?.length) await sb.storage.from("avatars").remove(av2.map(f => `${me.id}/${f.name}`));
@@ -585,7 +626,7 @@ function vlogCard(v, showGroup) {
     <div class="vlog-head">${av(v.author,"sm")}<div class="t"><b>${esc(shown(v.author))}${crown(v.author, v.group_id)}</b><span class="small muted">${showGroup&&g?esc(g.name)+" · ":""}${niceDate(v.vlog_date,{day:"numeric",month:"long"})} · ${esc(v.title)}</span></div></div>
     <div class="poster" id="stage-${v.id}" style="background:${GRADS[hash(v.id)%GRADS.length]}">
       ${url ? `<video id="vid-${v.id}" src="${url}#t=${(e.start||0)+0.1}" playsinline preload="metadata" style="filter:${FILTERS[e.filter]||"none"}"></video>${capHTML(e)}` : `<div class="ttl">${esc(v.title)}${v.video_path ? "" : `<div class="small" style="font-family:var(--body);margin-top:8px;opacity:.85">Video gewist na 35 dagen</div>`}</div>`}
-      ${len ? `<span class="tc">${len}</span>` : ""}${e.music && TRACKS[e.music] ? `<span class="pill mus">${ic("music","s")} ${TRACKS[e.music].label}</span>` : ""}
+      ${len ? `<span class="tc">${len}</span>` : ""}${(e.music === "custom" || e.music === "sound") && e.musicName ? `<span class="pill mus">${ic("music","s")} ${esc(e.musicName.length > 22 ? e.musicName.slice(0, 21) + "…" : e.musicName)}</span>` : e.music && TRACKS[e.music] ? `<span class="pill mus">${ic("music","s")} ${TRACKS[e.music].label}</span>` : ""}
       ${url ? `<button class="play" data-act="play" data-id="${v.id}" aria-label="Vlog van ${esc(shown(v.author))} afspelen">${ic("play")}</button>` : ""}
       <div class="prog"><i id="prog-${v.id}" style="width:${watched?100:0}%"></i></div></div>
     <div class="vlog-body">
@@ -657,16 +698,18 @@ let rec = null;
 const REC_TYPES = ["video/mp4;codecs=avc1,mp4a", "video/mp4", "video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
 async function openRecorder() {
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { toast("Filmen in de app lukt niet in deze browser. Kies een video uit je galerij."); return; }
-  rec = { facing: "user", chunks: [], mr: null, stream: null, t0: 0, iv: 0 };
+  rec = { facing: "user", chunks: [], mr: null, stream: null, t0: 0, iv: 0, music: null };
   const box = document.createElement("div"); box.className = "rec"; box.id = "rec";
   box.innerHTML = `<video id="camv" playsinline muted autoplay></video>
-    <div class="bar-top"><button class="round" id="camClose" aria-label="Sluiten">${ic("x")}</button><span class="time" id="camTime">0:00 / ${mmss(MAX_REC)}</span><span style="width:52px"></span></div>
+    <div class="bar-top"><button class="round" id="camClose" aria-label="Sluiten">${ic("x")}</button><span class="time" id="camTime">0:00 / ${mmss(MAX_REC)}</span><button class="round" id="camMusic" aria-label="Muziek tijdens filmen">${ic("music")}</button></div>
+    <div class="cam-sheet" id="camSheet" hidden></div>
     <div class="hint" id="camHint">Tik op de rode knop om te filmen</div>
     <div class="ctl"><span style="width:52px"></span><button class="shutter" id="camShut" aria-label="Opnemen"><i></i></button><button class="round" id="camFlip" aria-label="Andere camera">${ic("flip")}</button></div>`;
   document.body.appendChild(box); document.body.style.overflow = "hidden";
   $("camClose").onclick = () => closeRecorder();
   $("camFlip").onclick = () => { if (!rec.mr) startCam(rec.facing === "user" ? "environment" : "user"); };
   $("camShut").onclick = () => rec.mr ? stopRec() : startRec();
+  $("camMusic").onclick = () => { if (rec.mr) return; const s = $("camSheet"); s.hidden = !s.hidden; if (!s.hidden) drawCamSheet(); };
   try { await startCam("user"); }
   catch (e) { closeRecorder(); toast("Geen toegang tot je camera. Sta het toe in je browser, of kies een video uit je galerij."); }
 }
@@ -678,8 +721,30 @@ async function startCam(facing) {
   const v = $("camv"); v.srcObject = stream; v.style.transform = facing === "user" ? "scaleX(-1)" : "";
   try { await v.play(); } catch (e) {}
 }
+// Kies muziek die meespeelt terwijl je filmt
+function drawCamSheet() {
+  const gid = view.id, songs = (lib[gid] || []).filter(s => s.kind === "music");
+  const opt = (key, label, sub, on) => `<button class="track" data-cm="${key}" aria-pressed="${on}"><span class="art" style="background:var(--raise)">${ic("music","s")}</span><span class="t"><b>${esc(label)}</b><span class="small muted">${esc(sub)}</span></span>${on ? ic("check","s") : ""}</button>`;
+  const cur = rec.music ? rec.music.key : "";
+  $("camSheet").innerHTML = `<div class="label">Muziek tijdens het filmen</div>
+    <div class="tracks">${opt("", "Geen muziek", "Alleen het geluid van je camera", !cur)}
+    ${songs.map(s => opt("s:" + s.id, s.name, `van ${shown(s.user_id)} · ${mmss(s.duration || 0)}`, cur === "s:" + s.id)).join("")}
+    ${Object.entries(TRACKS).map(([k, t]) => opt("b:" + k, t.label, "Ingebouwd deuntje", cur === "b:" + k)).join("")}</div>
+    <span class="small muted">Tip: met oortjes hoor je de muziek, en neemt je microfoon ze niet mee op. In de studio voeg je de muziek dan zuiver toe.</span>`;
+  $("camSheet").querySelectorAll("[data-cm]").forEach(b => b.onclick = () => {
+    const k = b.dataset.cm;
+    rec.music = !k ? null : k.startsWith("s:") ? { key: k, sound: soundById(gid, k.slice(2)) } : { key: k, builtin: k.slice(2) };
+    stopMusic();
+    if (rec.music) startMusic(rec.music.sound ? { url: signed[rec.music.sound.path], offset: 0 } : rec.music.builtin, .6);
+    setTimeout(() => { if (rec && !rec.mr) stopMusic(); }, 3000);
+    drawCamSheet();
+    const btn = $("camMusic"); if (btn) btn.classList.toggle("on", !!rec.music);
+  });
+}
 function startRec() {
   const type = REC_TYPES.find(t => MediaRecorder.isTypeSupported(t)) || "";
+  $("camSheet").hidden = true; $("camMusic").disabled = true;
+  if (rec.music) { ac(); startMusic(rec.music.sound ? { url: signed[rec.music.sound.path], offset: 0 } : rec.music.builtin, .6); }
   try { rec.mr = new MediaRecorder(rec.stream, { mimeType: type || undefined, videoBitsPerSecond: 2_000_000, audioBitsPerSecond: 96_000 }); }
   catch (e) { rec.mr = new MediaRecorder(rec.stream); }
   rec.chunks = [];
@@ -687,7 +752,12 @@ function startRec() {
   rec.mr.onstop = () => {
     const secs = (Date.now() - rec.t0) / 1000;
     const blob = new Blob(rec.chunks, { type: (rec.mr.mimeType || type || "video/webm").split(";")[0] });
-    closeRecorder(); loadDraft(blob, secs);
+    const m = rec.music;
+    // de muziek die tijdens het filmen speelde, staat meteen klaar in de studio en loopt gelijk met je beelden
+    const preset = !m ? null : m.sound
+      ? { music: "sound", soundId: m.sound.id, musicPath: m.sound.path, musicName: m.sound.name, musicOffset: 0, musicSync: true, origVol: .6 }
+      : { music: m.builtin, origVol: .6 };
+    stopMusic(); closeRecorder(); loadDraft(blob, secs, preset);
   };
   rec.mr.start(1000); rec.t0 = Date.now();
   $("camShut").classList.add("on"); $("camShut").setAttribute("aria-label", "Stoppen");
@@ -698,21 +768,24 @@ function stopRec() { if (rec?.mr && rec.mr.state !== "inactive") { clearInterval
 function closeRecorder() {
   if (!rec) return;
   clearInterval(rec.iv);
+  if (!rec.mr) stopMusic();
   if (rec.stream) rec.stream.getTracks().forEach(t => t.stop());
   $("rec")?.remove(); document.body.style.overflow = ""; rec = null;
 }
 
 /* ---------- studio ---------- */
-const TOOLS = [["trim","Knippen","cut"],["filter","Filters","filter"],["text","Tekst","text"],["music","Muziek","music"],["sfx","Geluidjes","sound"],["speed","Snelheid","speed"],["mix","Volume","mix"]];
-function loadDraft(blob, knownDur) {
+const TOOLS = [["trim","Knippen","cut"],["filter","Filters","filter"],["text","Tekst","text"],["music","Muziek","music"],["sfx","Geluidjes","sound"],["voice","Stem","mic"],["speed","Snelheid","speed"],["mix","Volume","mix"]];
+function loadDraft(blob, knownDur, preset) {
   if (!blob || !blob.size) { toast("De opname is leeg. Probeer opnieuw."); return; }
   if (blob.size > 1500 * 1048576) { toast(`Deze video is ${Math.round(blob.size/1048576)} MB, dat is te groot om te verkleinen. Kies een kortere video.`); return; }
   if (blob.size > MAX_BYTES) toast(`Deze video is ${Math.round(blob.size/1048576)} MB. Hij wordt bij het plaatsen automatisch verkleind.`);
   const url = URL.createObjectURL(blob), probe = document.createElement("video");
   probe.preload = "metadata"; probe.muted = true; probe.src = url;
   const ready = dur => {
-    draft = { blob, url, type: blob.type || "video/mp4", dur, start: 0, end: dur, filter: "Geen", caption: "", textStyle: "serif", textPos: "bot", title: "", music: null, musicVol: .5, origVol: 1, sfxVol: .9, speed: 1, sfx: [] };
-    tool = "trim"; sfxAt = 0; render(true);
+    draft = { blob, url, type: blob.type || "video/mp4", dur, start: 0, end: dur, filter: "Geen", caption: "", textStyle: "serif", textPos: "bot", title: "",
+      music: null, musicVol: .5, musicOffset: 0, musicSync: false, origVol: 1, sfxVol: .9, voice: null, voiceVol: 1, speed: 1, sfx: [], ...(preset || {}) };
+    tool = preset ? "music" : "trim"; sfxAt = 0; render(true);
+    if (preset) toast("De muziek van tijdens het filmen staat klaar. Druk op afspelen.");
   };
   probe.onloadedmetadata = () => {
     if (isFinite(probe.duration) && probe.duration > 0) return ready(probe.duration);
@@ -731,10 +804,10 @@ function bindStudio() {
   $("pvPlay").onclick = () => {
     if (playingOn(pv)) { stopEdit(); setPlayIcon(false); return; }
     setPlayIcon(true);
-    playEdit(pv, draft, $("stage"), t => drawHead(t), () => { setPlayIcon(false); pv.currentTime = draft.start; drawHead(draft.start); }, () => { setPlayIcon(false); toast("Afspelen lukte niet. Tik nog eens op afspelen."); });
+    playEdit(pv, draftCfg(), $("stage"), t => drawHead(t), () => { setPlayIcon(false); pv.currentTime = draft.start; drawHead(draft.start); }, () => { setPlayIcon(false); toast("Afspelen lukte niet. Tik nog eens op afspelen."); });
   };
   $("ttl").oninput = e => draft.title = e.target.value;
-  $("cancel").onclick = () => { stopEdit(); URL.revokeObjectURL(draft.url); draft = null; render(true); };
+  $("cancel").onclick = () => { stopEdit(); stopVoiceRec(true); URL.revokeObjectURL(draft.url); draft = null; render(true); };
   $("publish").onclick = publish;
 }
 async function publish() {
@@ -743,7 +816,7 @@ async function publish() {
   publishing = true; const btn = $("publish"); btn.disabled = true; btn.innerHTML = `<span class="spin"></span> Uploaden…`;
   let { blob, url, ...rest } = draft;
   let type = (draft.type || "video/mp4").split(";")[0];
-  let start = rest.start, end = rest.end, dur = rest.dur, sfx = rest.sfx.map(s => ({ ...s }));
+  let start = rest.start, end = rest.end, dur = rest.dur, sfx = rest.sfx.map(s => ({ ...s })), shift = 0;
   try {
     if (blob.size > MAX_BYTES) {
       // Verklein alleen het stuk dat je hebt gehouden, op ongeveer 720p
@@ -751,7 +824,7 @@ async function publish() {
       const out = await compressRange(url, start, end, p => { btn.innerHTML = `<span class="spin"></span> Verkleinen… ${Math.round(p * 100)}%`; });
       if (out.blob.size > MAX_BYTES) throw new Error("Ook verkleind is deze video groter dan 50 MB. Knip hem korter.");
       blob = out.blob; type = out.blob.type || "video/webm";
-      sfx = sfx.map(s => ({ ...s, t: Math.max(0, s.t - start) })); dur = out.dur; start = 0; end = out.dur;
+      sfx = sfx.map(s => ({ ...s, t: Math.max(0, s.t - start) })); shift = start; dur = out.dur; start = 0; end = out.dur;
       url = URL.createObjectURL(blob);
       btn.innerHTML = `<span class="spin"></span> Uploaden…`;
     }
@@ -759,18 +832,32 @@ async function publish() {
   const ext = type.includes("webm") ? "webm" : type.includes("quicktime") ? "mov" : "mp4";
   const path = `${g.id}/${crypto.randomUUID()}.${ext}`;
   const edit = { start, end, dur, filter: rest.filter, caption: rest.caption.trim(), textStyle: rest.textStyle, textPos: rest.textPos,
-    music: rest.music, musicVol: rest.musicVol, origVol: rest.origVol, sfxVol: rest.sfxVol, speed: rest.speed, sfx };
+    music: rest.music, musicVol: rest.musicVol, musicOffset: (rest.musicOffset || 0) + (rest.musicSync ? shift : 0), musicSync: !!rest.musicSync,
+    origVol: rest.origVol, sfxVol: rest.sfxVol, voiceVol: rest.voiceVol, speed: rest.speed,
+    sfx: sfx.map(s => s.path ? { type: "sound", t: s.t, path: s.path, name: s.name, soundId: s.soundId } : { type: s.type, t: s.t }) };
+  if (rest.music === "sound") Object.assign(edit, { musicPath: rest.musicPath, musicName: rest.musicName, soundId: rest.soundId });
+  let voicePath = null;
   try {
     const up = await sb.storage.from("vlogs").upload(path, blob, { contentType: type, upsert: false });
     if (up.error) throw up.error;
+    if (rest.voice) {
+      btn.innerHTML = `<span class="spin"></span> Stem uploaden…`;
+      voicePath = `${g.id}/${crypto.randomUUID()}.${musicExt(rest.voice.file)}`;
+      const uv = await sb.storage.from("vlogs").upload(voicePath, rest.voice.file, { contentType: musicType(rest.voice.file), upsert: false });
+      if (uv.error) { await sb.storage.from("vlogs").remove([path]); voicePath = null; throw uv.error; }
+      edit.voicePath = voicePath;
+    }
     const ins = await sb.from("vlogs").insert({ group_id: g.id, author: me.id, vlog_date: todayStr(), title: rest.title.trim() || "Mijn dag", video_path: path, edit }).select(VSEL).single();
-    if (ins.error) { await sb.storage.from("vlogs").remove([path]); throw ins.error; }
+    if (ins.error) { await sb.storage.from("vlogs").remove([path, voicePath].filter(Boolean)); throw ins.error; }
     VL.set(ins.data.id, ins.data); signed[path] = url;
+    if (voicePath) signed[voicePath] = rest.voice.url;
+    const musicPath = voicePath;
     groupIds[g.id] = [ins.data.id, ...(groupIds[g.id] || [])];
     draft = null; publishing = false; gtab = "feed"; render();
     toast("Geplaatst. Je vrienden kunnen nu kijken en scoren.");
     sb.functions.invoke(JOBS_FUNCTION, { body: { type: "new_vlog", vlog_id: ins.data.id } }).catch(() => {});
-    signed[path] = undefined; await signUrls([path]);
+    signed[path] = undefined; if (musicPath) signed[musicPath] = undefined;
+    await signUrls([path, musicPath].filter(Boolean));
   } catch (e) {
     publishing = false; btn.disabled = false; btn.textContent = "Plaatsen"; toast(errMsg(e));
   }
@@ -826,37 +913,78 @@ function applyLook() {
 }
 function drawTimeline() {
   const tl = $("tl"); if (!tl) return; const D = draft.dur, p = x => (x / D * 100) + "%";
-  tl.innerHTML = `<div class="keep" style="left:${p(draft.start)};width:${(draft.end-draft.start)/D*100}%"></div>${draft.music?`<div class="musicband" style="left:${p(draft.start)};right:${100-draft.end/D*100}%"></div>`:""}${draft.sfx.map(s => `<span class="mk" style="left:${p(s.t)}" title="${SFX[s.type].label}">${SFX[s.type].emo}</span>`).join("")}<div class="head" id="head" style="left:${p($("pv")?.currentTime || draft.start)}"></div>`;
+  tl.innerHTML = `<div class="keep" style="left:${p(draft.start)};width:${(draft.end-draft.start)/D*100}%"></div>${draft.music?`<div class="musicband" style="left:${p(draft.start)};right:${100-draft.end/D*100}%"></div>`:""}${draft.sfx.map(s => `<span class="mk" style="left:${p(s.t)}" title="${esc(s.path ? s.name : SFX[s.type].label)}">${s.path ? "🔊" : SFX[s.type].emo}</span>`).join("")}<div class="head" id="head" style="left:${p($("pv")?.currentTime || draft.start)}"></div>`;
 }
 function drawHead(t) { const h = $("head"); if (h) h.style.left = (t / draft.dur * 100) + "%"; }
 function drawTools() {
-  $("toolRow").innerHTML = TOOLS.map(([k,l,i]) => { const badge = k==="sfx"&&draft.sfx.length ? `<b>${draft.sfx.length}</b>` : k==="music"&&draft.music ? "<b>1</b>" : "";
+  $("toolRow").innerHTML = TOOLS.map(([k,l,i]) => { const badge = k==="sfx"&&draft.sfx.length ? `<b>${draft.sfx.length}</b>` : k==="music"&&draft.music ? "<b>1</b>" : k==="voice"&&draft.voice ? "<b>1</b>" : "";
     return `<button class="tool" role="tab" data-tool="${k}" aria-pressed="${tool===k}"><span class="sq">${ic(i)}${badge}</span>${l}</button>`; }).join("");
   document.querySelectorAll("[data-tool]").forEach(b => b.onclick = () => { tool = b.dataset.tool; drawTools(); drawPanel(); });
 }
+// Hoe de studio de vlog afspeelt: met de tijdelijke links naar muziek, stem en eigen geluiden
+function draftCfg() {
+  const d = draft;
+  return { ...d,
+    musicUrl: d.music === "sound" && d.musicPath ? signed[d.musicPath] : null,
+    voiceUrl: d.voice ? d.voice.url : null,
+    sfx: d.sfx.map(s => s.path ? { ...s, url: signed[s.path] } : s) };
+}
+const MAX_MUSIC = 15 * 1024 * 1024;
+const MAX_FX = 10;
+const sfxLabel = s => s.path ? `🔊 ${esc(s.name || "Geluid")}` : `${SFX[s.type].emo} ${SFX[s.type].label}`;
+function soundRow(s, on) {
+  const mine = s.user_id === me.id;
+  return `<div class="track" data-song="${s.id}" aria-pressed="${on}" role="button" tabindex="0"><span class="art" style="background:linear-gradient(160deg,var(--amber),var(--hot))">${ic("music","s")}</span><span class="t"><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</b><span class="small muted">van ${esc(shown(s.user_id))} · ${mmss(s.duration || 0)}</span></span>${on ? ic("check","s") : ""}${mine ? `<button class="x" data-snd-del="${s.id}" aria-label="${esc(s.name)} uit de groep verwijderen">${ic("x","s")}</button>` : ""}</div>`;
+}
 function drawPanel() {
-  const P2 = $("toolPanel"), d = draft, pv = $("pv");
+  const P2 = $("toolPanel"), d = draft, pv = $("pv"), gid = view.id;
+  if (!P2 || !d) return;
   const R = (id, label, min, max, step, v, show) => `<div class="field"><span class="label">${label}</span><div class="range-row"><input id="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${v}" aria-label="${label}"><span class="mono" id="${id}v">${show}</span></div></div>`;
   const pct = x => Math.round(x * 100) + "%";
   const at = Math.min(Math.max(sfxAt, d.start), d.end);
+  const songs = (lib[gid] || []).filter(s => s.kind === "music"), effects = (lib[gid] || []).filter(s => s.kind === "effect");
+  const cur = d.music === "sound" ? (soundById(gid, d.soundId) || { name: d.musicName, duration: 0 }) : null;
   const html = {
     trim: () => R("rs","Begin",0,d.dur,.1,d.start,mmss(d.start)) + R("re","Einde",0,d.dur,.1,d.end,mmss(d.end)),
     filter: () => `<div class="swatches">${Object.keys(FILTERS).map(f => `<button class="sw" data-v="${f}" aria-pressed="${d.filter===f}"><i style="filter:${FILTERS[f]}"></i>${f}</button>`).join("")}</div>`,
     text: () => `<div class="field"><label class="label" for="cap">Tekst op de video</label><input id="cap" type="text" maxlength="40" value="${esc(d.caption)}" placeholder="bv. Maandag in de werkplaats"></div>
       <div class="field"><span class="label">Stijl</span><div class="opts" data-group="textStyle">${Object.entries(TEXTSTYLES).map(([k,l]) => `<button data-v="${k}" aria-pressed="${d.textStyle===k}">${l}</button>`).join("")}</div></div>
       <div class="field"><span class="label">Plaats</span><div class="opts" data-group="textPos">${Object.entries(TEXTPOS).map(([k,l]) => `<button data-v="${k}" aria-pressed="${d.textPos===k}">${l}</button>`).join("")}</div></div>`,
-    music: () => `<div class="tracks"><button class="track" data-v="" aria-pressed="${!d.music}"><span class="art" style="background:var(--raise)">${ic("x","s")}</span><span class="t"><b>Geen muziek</b><span class="small muted">Alleen het geluid van je video</span></span></button>
-      ${Object.entries(TRACKS).map(([k,t]) => `<button class="track" data-v="${k}" aria-pressed="${d.music===k}"><span class="art" style="background:${t.art}">${ic("music","s")}</span><span class="t"><b>${t.label}</b><span class="small muted">${t.file ? "Echt nummer" : t.sub}</span></span>${d.music===k?ic("check","s"):""}</button>`).join("")}</div>`,
+    music: () => `<div class="field"><span class="label">Geluiden van je groep</span>
+        ${songs.length ? `<div class="tracks">${songs.map(s => soundRow(s, d.music === "sound" && d.soundId === s.id)).join("")}</div>` : `<span class="small muted">Nog geen nummers in je groep. Importeer het eerste!</span>`}
+        <label class="btn soft full" for="musicFile">${ic("upload","s")} Muziek importeren</label>
+        <input id="musicFile" type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg" hidden>
+        <span class="small muted" id="musicStatus">Een mp3, m4a of wav, max. 15 MB. Wat je importeert, kan je hele groep ook gebruiken. Gebruik alleen muziek die je mag gebruiken.</span></div>
+      ${cur ? (d.musicSync ? `<span class="small muted">🎬 Deze muziek speelde tijdens het filmen en loopt gelijk met je beelden, ook als je knipt.</span>`
+        : cur.duration > 5 ? R("mo","Begin van het nummer",0,Math.max(0, Math.floor(cur.duration - 5)),1,d.musicOffset || 0,mmss(d.musicOffset || 0)) : "") : ""}
+      <div class="label" style="margin-top:4px">Ingebouwde deuntjes</div>
+      <div class="tracks"><button class="track" data-v="" aria-pressed="${!d.music}"><span class="art" style="background:var(--raise)">${ic("x","s")}</span><span class="t"><b>Geen muziek</b><span class="small muted">Alleen het geluid van je video</span></span></button>
+      ${Object.entries(TRACKS).map(([k,t]) => `<button class="track" data-v="${k}" aria-pressed="${d.music===k}"><span class="art" style="background:${t.art}">${ic("music","s")}</span><span class="t"><b>${t.label}</b><span class="small muted">${t.sub}</span></span>${d.music===k?ic("check","s"):""}</button>`).join("")}</div>`,
     sfx: () => R("at","Moment in je video",d.start,d.end,.1,at,mmss(at)) +
-      `<div class="sfxgrid">${Object.entries(SFX).map(([k,s]) => `<button class="sfx" data-v="${k}"><span>${s.emo}</span>${s.label}</button>`).join("")}</div>
+      `<div class="sfxgrid">${Object.entries(SFX).map(([k,s]) => `<button class="sfx" data-v="${k}"><span>${s.emo}</span>${s.label}</button>`).join("")}
+        ${effects.map(s => `<button class="sfx" data-fx="${s.id}" title="van ${esc(shown(s.user_id))}"><span>🔊</span>${esc(s.name.length > 10 ? s.name.slice(0, 9) + "…" : s.name)}</button>`).join("")}</div>
       <p class="small muted" style="margin:0">Kies een moment en tik op een geluidje om het daar te plaatsen.</p>
-      ${d.sfx.length ? `<div class="placed">${d.sfx.map((s,i) => `<div><span>${SFX[s.type].emo}</span><b style="flex:1">${SFX[s.type].label}</b><span class="mono">${mmss(s.t)}</span><button class="x" data-del="${i}" aria-label="${SFX[s.type].label} verwijderen">${ic("x","s")}</button></div>`).join("")}</div>` : ""}`,
+      ${d.sfx.length ? `<div class="placed">${d.sfx.map((s,i) => `<div><b style="flex:1">${sfxLabel(s)}</b><span class="mono">${mmss(s.t)}</span><button class="x" data-del="${i}" aria-label="Geluid verwijderen">${ic("x","s")}</button></div>`).join("")}</div>` : ""}
+      <div class="field" style="border-top:1px solid var(--line);padding-top:12px"><span class="label">Eigen geluid maken</span>
+        <input id="fxName" type="text" maxlength="30" placeholder="Naam, bv. Lars zijn lach">
+        <div style="display:flex;gap:8px"><button class="btn soft sm" style="flex:1" id="fxRec">${fxRec ? ic("stop","s") + " Stoppen" : ic("mic","s") + " Opnemen"}</button><label class="btn soft sm" style="flex:1" for="fxFile">${ic("upload","s")} Importeren</label></div>
+        <input id="fxFile" type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg" hidden>
+        <span class="small muted" id="fxStatus">${fxRec ? "Opnemen…" : `Max. ${MAX_FX} seconden. Je groep kan het daarna ook gebruiken.`}</span></div>
+      ${effects.some(s => s.user_id === me.id) ? `<div class="field"><span class="label">Jouw geluiden in de groep</span><div class="placed">${effects.filter(s => s.user_id === me.id).map(s => `<div><b style="flex:1">🔊 ${esc(s.name)}</b><button class="x" data-snd-del="${s.id}" aria-label="${esc(s.name)} verwijderen">${ic("x","s")}</button></div>`).join("")}</div></div>` : ""}`,
+    voice: () => voiceRec
+      ? `<p style="margin:0"><b>🔴 Je stem wordt opgenomen…</b></p><span class="small muted">Praat terwijl je video speelt. De opname stopt vanzelf op het einde.</span><button class="btn" id="voiceRec">${ic("stop","s")} Stoppen</button>`
+      : d.voice
+        ? `<div class="track" style="cursor:default"><span class="art" style="background:linear-gradient(160deg,var(--amber),var(--hot))">${ic("mic","s")}</span><span class="t"><b>Je stem</b><span class="small muted">${mmss(d.voice.dur)} ingesproken</span></span><button class="x" id="voiceDel" aria-label="Stem verwijderen">${ic("x","s")}</button></div>
+           <button class="btn soft" id="voiceRec">${ic("mic","s")} Opnieuw inspreken</button>`
+        : `<p class="small muted" style="margin:0">Spreek iets in over je video, zoals een verteller. Je video speelt af zonder geluid terwijl je praat.</p><button class="btn" id="voiceRec">${ic("mic","s")} Start met inspreken</button>`,
     speed: () => `<div class="opts" data-group="speed">${SPEEDS.map(s => `<button data-v="${s}" aria-pressed="${d.speed===s}">${String(s).replace(".",",")}×</button>`).join("")}</div><p class="small muted" style="margin:0">0,5× is slow-motion, 2× maakt saaie stukken snel.</p>`,
-    mix: () => R("vo","Geluid van je video",0,1,.05,d.origVol,pct(d.origVol)) + R("vm","Muziek",0,1,.05,d.musicVol,pct(d.musicVol)) + R("vs","Geluidjes",0,1,.05,d.sfxVol,pct(d.sfxVol))
+    mix: () => R("vo","Geluid van je video",0,1,.05,d.origVol,pct(d.origVol)) + R("vm","Muziek",0,1,.05,d.musicVol,pct(d.musicVol)) + R("vs","Geluidjes",0,1,.05,d.sfxVol,pct(d.sfxVol)) + (d.voice ? R("vv","Je stem",0,1,.05,d.voiceVol,pct(d.voiceVol)) : "")
   }[tool]();
   P2.innerHTML = html;
+
   const on = (id, fn) => { const el = $(id); if (el) el.oninput = fn; };
   const setv = (id, txt) => { const e = $(id + "v"); if (e) e.textContent = txt; };
+  const redraw = () => { drawTimeline(); drawTools(); drawPanel(); };
   on("rs", e => { d.start = Math.min(+e.target.value, d.end - .5); e.target.value = d.start; pv.currentTime = d.start; setv("rs", mmss(d.start)); d.sfx = d.sfx.filter(s => s.t >= d.start); drawTimeline(); applyLook(); });
   on("re", e => { d.end = Math.max(+e.target.value, d.start + .5); e.target.value = d.end; pv.currentTime = d.end; setv("re", mmss(d.end)); d.sfx = d.sfx.filter(s => s.t <= d.end); drawTimeline(); applyLook(); });
   on("cap", e => { d.caption = e.target.value; applyLook(); });
@@ -864,25 +992,127 @@ function drawPanel() {
   on("vo", e => { d.origVol = +e.target.value; setv("vo", pct(d.origVol)); liveSet({ origVol: d.origVol }); });
   on("vm", e => { d.musicVol = +e.target.value; setv("vm", pct(d.musicVol)); liveSet({ musicVol: d.musicVol }); });
   on("vs", e => { d.sfxVol = +e.target.value; setv("vs", pct(d.sfxVol)); liveSet({ sfxVol: d.sfxVol }); });
+  on("vv", e => { d.voiceVol = +e.target.value; setv("vv", pct(d.voiceVol)); liveSet({ voiceVol: d.voiceVol }); });
+  on("mo", e => { d.musicOffset = +e.target.value; setv("mo", mmss(d.musicOffset)); });
+  const mo = $("mo"); if (mo) mo.onchange = () => previewMusic();
   P2.querySelectorAll(".sw").forEach(b => b.onclick = () => { d.filter = b.dataset.v; applyLook(); drawPanel(); });
   P2.querySelectorAll(".opts").forEach(grp => grp.querySelectorAll("button").forEach(b => b.onclick = () => {
     const k = grp.dataset.group; d[k] = k === "speed" ? +b.dataset.v : b.dataset.v;
     if (k === "speed") liveSet({ speed: d.speed }); applyLook(); drawPanel(); }));
-  P2.querySelectorAll(".track").forEach(b => b.onclick = () => {
-    d.music = b.dataset.v || null;
-    if (!playingOn(pv)) { if (d.music) { startMusic(d.music, d.musicVol); setTimeout(() => { if (!playingOn($("pv"))) stopMusic(); }, 3000); } else stopMusic(); }
-    drawTimeline(); drawTools(); drawPanel(); });
-  P2.querySelectorAll(".sfx").forEach(b => b.onclick = () => {
+  // ingebouwde deuntjes
+  P2.querySelectorAll(".track[data-v]").forEach(b => b.onclick = () => { d.music = b.dataset.v || null; d.musicSync = false; previewMusic(); redraw(); });
+  // nummers uit de groep
+  P2.querySelectorAll("[data-song]").forEach(b => b.onclick = ev => {
+    if (ev.target.closest("[data-snd-del]")) return;
+    const s = soundById(gid, b.dataset.song); if (!s) return;
+    Object.assign(d, { music: "sound", soundId: s.id, musicPath: s.path, musicName: s.name, musicOffset: 0, musicSync: false });
+    previewMusic(); redraw(); });
+  P2.querySelectorAll("[data-snd-del]").forEach(b => b.onclick = async ev => {
+    ev.stopPropagation();
+    if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.style.color = "var(--warn)"; toast("Tik nog eens op het kruisje om dit geluid voor iedereen in de groep te verwijderen."); return; }
+    try {
+      const s = soundById(gid, b.dataset.sndDel); await deleteSound(gid, b.dataset.sndDel);
+      if (s && d.soundId === s.id) { d.music = null; stopMusic(); }
+      if (s) d.sfx = d.sfx.filter(x => x.path !== s.path);
+      toast("Geluid verwijderd."); redraw();
+    } catch (e) { toast(errMsg(e)); }
+  });
+  const mf = $("musicFile"); if (mf) mf.onchange = ev => { const f = ev.target.files[0]; if (f) importSong(f); };
+  // geluidseffecten
+  P2.querySelectorAll(".sfx[data-v]").forEach(b => b.onclick = () => {
     const t = Math.min(Math.max(sfxAt, d.start), d.end);
-    d.sfx.push({ type: b.dataset.v, t }); d.sfx.sort((a, b) => a.t - b.t); previewSfx(b.dataset.v);
-    drawTimeline(); drawTools(); drawPanel(); });
-  P2.querySelectorAll("[data-del]").forEach(b => b.onclick = () => { d.sfx.splice(+b.dataset.del, 1); drawTimeline(); drawTools(); drawPanel(); });
+    d.sfx.push({ type: b.dataset.v, t }); d.sfx.sort((a, b) => a.t - b.t); previewSfx(b.dataset.v); redraw(); });
+  P2.querySelectorAll("[data-fx]").forEach(b => b.onclick = () => {
+    const s = soundById(gid, b.dataset.fx); if (!s) return;
+    const t = Math.min(Math.max(sfxAt, d.start), d.end);
+    d.sfx.push({ type: "sound", t, path: s.path, name: s.name, soundId: s.id }); d.sfx.sort((a, b) => a.t - b.t);
+    playOnce(signed[s.path]); redraw(); });
+  P2.querySelectorAll("[data-del]").forEach(b => b.onclick = () => { d.sfx.splice(+b.dataset.del, 1); redraw(); });
+  const fr2 = $("fxRec"); if (fr2) fr2.onclick = () => toggleFxRec();
+  const ff = $("fxFile"); if (ff) ff.onchange = ev => { const f = ev.target.files[0]; if (f) importEffect(f, ($("fxName")?.value.trim()) || f.name.replace(/\.[^.]+$/, "")); };
+  // stem
+  const vr = $("voiceRec"); if (vr) vr.onclick = () => toggleVoiceRec();
+  const vd = $("voiceDel"); if (vd) vd.onclick = () => { if (d.voice) URL.revokeObjectURL(d.voice.url); d.voice = null; redraw(); };
+}
+function previewMusic() {
+  const d = draft, pv = $("pv"); if (!d || playingOn(pv)) return;
+  const src = d.music === "sound" ? (signed[d.musicPath] ? { url: signed[d.musicPath], offset: d.musicSync ? 0 : (d.musicOffset || 0) } : null) : d.music;
+  clearTimeout(previewMusic.t);
+  if (src) { startMusic(src, d.musicVol); previewMusic.t = setTimeout(() => { if (!playingOn($("pv"))) stopMusic(); }, 4000); } else stopMusic();
+}
+function playOnce(url) { if (!url) return; const a = new Audio(url); a.volume = .9; a.play().catch(() => {}); }
+function audioOk(file) { return (file.type || "").startsWith("audio/") || /\.(mp3|m4a|wav|aac|ogg|flac|webm)$/i.test(file.name || ""); }
+
+// Een nummer importeren: het komt meteen in de geluiden van je groep
+async function importSong(file) {
+  if (!audioOk(file)) { toast("Kies een muziekbestand, zoals een mp3."); return; }
+  if (file.size > MAX_MUSIC) { toast(`Dit nummer is ${Math.round(file.size/1048576)} MB. Het maximum is 15 MB.`); return; }
+  const url = URL.createObjectURL(file), dur = await probeDuration(url); URL.revokeObjectURL(url);
+  if (dur < 0) { toast("Dit bestand kan niet afgespeeld worden. Probeer een mp3."); return; }
+  const st = $("musicStatus"); if (st) st.innerHTML = `<span class="spin" style="display:inline-block;width:14px;height:14px;vertical-align:middle"></span> Uploaden naar je groep…`;
+  try {
+    const s = await uploadSound(view.id, file, "music", file.name.replace(/\.[^.]+$/, "") || "Nummer", dur);
+    if (!draft) return;
+    Object.assign(draft, { music: "sound", soundId: s.id, musicPath: s.path, musicName: s.name, musicOffset: 0, musicSync: false });
+    toast("Toegevoegd aan de geluiden van je groep."); drawTimeline(); drawTools(); drawPanel(); previewMusic();
+  } catch (e) { toast(errMsg(e)); drawPanel(); }
+}
+// Een kort geluidseffect importeren of opnemen
+async function importEffect(file, name) {
+  if (!audioOk(file)) { toast("Kies een geluidsbestand, zoals een mp3."); return; }
+  if (file.size > 3 * 1048576) { toast("Dit geluid is te groot. Een effect mag maximaal 3 MB zijn."); return; }
+  const url = URL.createObjectURL(file), dur = await probeDuration(url); URL.revokeObjectURL(url);
+  if (dur < 0) { toast("Dit bestand kan niet afgespeeld worden. Probeer een mp3."); return; }
+  if (dur > MAX_FX + 1) { toast(`Dit geluid duurt ${Math.round(dur)} seconden. Een effect mag maximaal ${MAX_FX} seconden duren.`); return; }
+  const st = $("fxStatus"); if (st) st.textContent = "Uploaden naar je groep…";
+  try {
+    const s = await uploadSound(view.id, file, "effect", name.slice(0, 30) || "Mijn geluid", dur > 0 ? dur : null);
+    toast(`"${s.name}" staat nu bij de geluidjes van je groep.`); playOnce(signed[s.path]);
+    const n = $("fxName"); if (n) n.value = "";
+    drawPanel();
+  } catch (e) { toast(errMsg(e)); drawPanel(); }
+}
+async function toggleFxRec() {
+  if (fxRec) { fxRec.stop(); return; }
+  try { fxRec = await recordAudio(); } catch (e) { fxRec = null; toast("Geen toegang tot je microfoon. Sta het toe in je browser."); return; }
+  const r = fxRec; drawPanel();
+  const iv = setInterval(() => { const s = (Date.now() - r.t0) / 1000, st = $("fxStatus"); if (st) st.textContent = `🔴 Opnemen… ${s.toFixed(1)} / ${MAX_FX} s`; if (s >= MAX_FX) r.stop(); }, 100);
+  const file = await r.done; clearInterval(iv); fxRec = null;
+  if (!draft) return;
+  await importEffect(file, ($("fxName")?.value.trim()) || "Mijn geluid");
+}
+// Je stem inspreken terwijl de video (zonder geluid) afspeelt
+async function toggleVoiceRec() {
+  if (voiceRec) { voiceRec.stop(); return; }
+  const pv = $("pv"); stopEdit();
+  try { voiceRec = await recordAudio(); } catch (e) { voiceRec = null; toast("Geen toegang tot je microfoon. Sta het toe in je browser."); return; }
+  const r = voiceRec; drawPanel(); setPlayIcon(true);
+  playEdit(pv, { ...draftCfg(), origVol: 0, music: null, voiceUrl: null, sfx: [] }, $("stage"), t => drawHead(t), () => r.stop(), () => r.stop());
+  const file = await r.done; const secs = (Date.now() - r.t0) / 1000;
+  voiceRec = null; stopEdit(); setPlayIcon(false);
+  if (!draft) return;
+  pv.currentTime = draft.start;
+  if (draft.voice) URL.revokeObjectURL(draft.voice.url);
+  draft.voice = { file, url: URL.createObjectURL(file), dur: secs };
+  toast("Stem opgenomen. Druk op afspelen om alles samen te horen."); drawTools(); drawPanel();
+}
+function stopVoiceRec() { if (voiceRec) voiceRec.stop(); if (fxRec) fxRec.stop(); }
+function musicExt(f) {
+  const m = /\.([a-z0-9]+)$/i.exec(f.name || ""); if (m) return m[1].toLowerCase();
+  return (f.type || "").includes("mp4") ? "m4a" : (f.type || "").includes("wav") ? "wav" : (f.type || "").includes("webm") ? "webm" : "mp3";
+}
+function musicType(f) {
+  if (f.type && f.type.startsWith("audio/")) return f.type.split(";")[0];
+  return { mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav", aac: "audio/aac", ogg: "audio/ogg", flac: "audio/flac", webm: "audio/webm" }[musicExt(f)] || "audio/mpeg";
 }
 
 /* ---------- playback in the feed ---------- */
 function playVlog(id) {
   const v = VL.get(id), el = $("vid-" + id); if (!v || !el) return;
   const e = { start: 0, end: 1e9, speed: 1, origVol: 1, sfxVol: .9, musicVol: .5, sfx: [], ...(v.edit || {}) };
+  if (e.music === "custom" || e.music === "sound") e.musicUrl = e.musicPath ? signed[e.musicPath] : null;
+  if (e.voicePath) e.voiceUrl = signed[e.voicePath];
+  e.sfx = (e.sfx || []).map(s => s.path ? { ...s, url: signed[s.path] } : s).filter(s => s.url || SFX[s.type]);
   const btn = document.querySelector(`[data-act="play"][data-id="${CSS.escape(id)}"]`); if (btn) btn.hidden = true;
   const p = $("prog-" + id);
   playEdit(el, e, $("stage-" + id),
